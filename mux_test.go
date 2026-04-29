@@ -151,6 +151,98 @@ func TestSlashPreviewFail(t *testing.T) {
 	}
 }
 
+func TestSlashPreviewSuccess(t *testing.T) {
+	cmd := New("/foo", "", func(fs *flag.FlagSet) Handlers {
+		id := fs.String("id", "", "")
+		return Handlers{
+			Preview: func(ctx context.Context, w Response) {
+				fmt.Fprintf(w, "preview id=%s", *id)
+			},
+			Execute: func(ctx context.Context, w Response) {},
+		}
+	})
+	m, ms := newMuxWithMock(t, cmd)
+	req := mockslack.SignedSlashRequest(t, "test-secret", "/foo", "-id u1", "U1", "alice", "C1", ms.ResponseURL())
+	w := httptest.NewRecorder()
+	m.SlashHandler().ServeHTTP(w, req)
+	calls := ms.WaitFor(1, time.Second)
+	body := calls[0].Body
+	if body["response_type"] != "in_channel" {
+		t.Fatalf("expected in_channel, got %v", body["response_type"])
+	}
+	blocks := body["blocks"].([]any)
+	rendered := flattenBlocksText(blocks)
+	if !strings.Contains(rendered, "preview id=u1") {
+		t.Fatalf("preview text missing: %s", rendered)
+	}
+	// Last block should be actions with Confirm + Cancel
+	last := blocks[len(blocks)-1].(map[string]any)
+	if last["type"] != "actions" {
+		t.Fatalf("last block not actions: %v", last)
+	}
+	// metadata should be present and decode
+	md := body["metadata"].(map[string]any)
+	if md["event_type"] != "slackflag" {
+		t.Fatalf("event_type: %v", md["event_type"])
+	}
+	payload := md["event_payload"].(map[string]any)
+	args := payload["args"].(map[string]any)
+	if args["id"] != "u1" {
+		t.Fatalf("args.id: %v", args["id"])
+	}
+	if payload["invoker"] != "U1" {
+		t.Fatalf("invoker: %v", payload["invoker"])
+	}
+}
+
+func TestSlashDirectFlow(t *testing.T) {
+	cmd := New("/foo", "", func(fs *flag.FlagSet) Handlers {
+		id := fs.String("id", "", "")
+		return Handlers{
+			Execute: func(ctx context.Context, w Response) {
+				fmt.Fprintf(w, "ran for %s", *id)
+			},
+		}
+	})
+	m, ms := newMuxWithMock(t, cmd)
+	req := mockslack.SignedSlashRequest(t, "test-secret", "/foo", "-id u1", "U1", "alice", "C1", ms.ResponseURL())
+	w := httptest.NewRecorder()
+	m.SlashHandler().ServeHTTP(w, req)
+	calls := ms.WaitFor(1, time.Second)
+	body := calls[0].Body
+	if body["response_type"] != "in_channel" {
+		t.Fatalf("expected in_channel, got %v", body["response_type"])
+	}
+	rendered := flattenBlocksText(body["blocks"].([]any))
+	if !strings.Contains(rendered, "ran for u1") {
+		t.Fatalf("output missing: %s", rendered)
+	}
+	if !strings.Contains(rendered, "ran by <@alice>") {
+		t.Fatalf("footer missing: %s", rendered)
+	}
+}
+
+func TestSlashDirectFlowFail(t *testing.T) {
+	cmd := New("/foo", "", func(fs *flag.FlagSet) Handlers {
+		return Handlers{
+			Execute: func(ctx context.Context, w Response) { w.Fail(fmt.Errorf("nope")) },
+		}
+	})
+	m, ms := newMuxWithMock(t, cmd)
+	req := mockslack.SignedSlashRequest(t, "test-secret", "/foo", "", "U1", "alice", "C1", ms.ResponseURL())
+	w := httptest.NewRecorder()
+	m.SlashHandler().ServeHTTP(w, req)
+	calls := ms.WaitFor(1, time.Second)
+	body := calls[0].Body
+	if body["response_type"] != "in_channel" {
+		t.Fatalf("direct flow Fail should still go in_channel for audit, got %v", body["response_type"])
+	}
+	rendered := flattenBlocksText(body["blocks"].([]any))
+	if !strings.Contains(rendered, ":x:") {
+		t.Fatalf("expected ❌ marker: %s", rendered)
+	}
+}
+
 // flattenBlocksText extracts visible text from a Slack blocks payload (test helper).
 func flattenBlocksText(blocks []any) string {
 	var sb strings.Builder
