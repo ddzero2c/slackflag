@@ -37,7 +37,12 @@ func TestVerifySignature(t *testing.T) {
 
 	later := now.Add(10 * time.Minute)
 	if err := verifySignature(secret, ts, body, sig, later, 5*time.Minute); err == nil {
-		t.Fatal("expired ts must fail")
+		t.Fatal("future-skew ts must fail")
+	}
+
+	earlier := now.Add(-10 * time.Minute)
+	if err := verifySignature(secret, ts, body, sig, earlier, 5*time.Minute); err == nil {
+		t.Fatal("past-skew ts must fail")
 	}
 
 	if err := verifySignature(secret, "abc", body, sig, now, 5*time.Minute); err == nil {
