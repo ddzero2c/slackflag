@@ -492,3 +492,48 @@ func basicConfirmPayload(respURL, cmdName, userID, userName string, eventPayload
 		"response_url": respURL,
 	}
 }
+
+func TestSlashConcurrentInvocations(t *testing.T) {
+	cmd := New("/foo", "", func(fs *flag.FlagSet) Handlers {
+		id := fs.String("id", "", "")
+		return Handlers{
+			Preview: func(ctx context.Context, w Response) {
+				fmt.Fprintf(w, "preview %s", *id)
+			},
+			Execute: func(ctx context.Context, w Response) {},
+		}
+	})
+	m, ms := newMuxWithMock(t, cmd)
+
+	const N = 20
+	done := make(chan struct{}, N)
+	for i := 0; i < N; i++ {
+		i := i
+		go func() {
+			defer func() { done <- struct{}{} }()
+			req := mockslack.SignedSlashRequest(t, "test-secret", "/foo",
+				fmt.Sprintf("-id u%d", i), fmt.Sprintf("U%d", i), "alice", "C1", ms.ResponseURL())
+			w := httptest.NewRecorder()
+			m.SlashHandler().ServeHTTP(w, req)
+		}()
+	}
+	for i := 0; i < N; i++ {
+		<-done
+	}
+	calls := ms.WaitFor(N, 5*time.Second)
+	seen := map[string]bool{}
+	for _, c := range calls {
+		blocks := c.Body["blocks"].([]any)
+		text := flattenBlocksText(blocks)
+		// each invocation should see its own id
+		for i := 0; i < N; i++ {
+			needle := fmt.Sprintf("preview u%d", i)
+			if strings.Contains(text, needle) {
+				seen[needle] = true
+			}
+		}
+	}
+	if len(seen) != N {
+		t.Fatalf("expected %d unique previews, got %d", N, len(seen))
+	}
+}
