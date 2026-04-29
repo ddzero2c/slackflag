@@ -343,3 +343,152 @@ func TestInteractionConfirmSuccess(t *testing.T) {
 
 // errFakeNotFound is a stable error for tests asserting on Fail behavior.
 var errFakeNotFound = fmt.Errorf("user not found")
+
+func TestInteractionExecuteFailPreservesButton(t *testing.T) {
+	cmd := New("/delete-user", "", func(fs *flag.FlagSet) Handlers {
+		return Handlers{
+			Preview: func(ctx context.Context, w Response) {},
+			Execute: func(ctx context.Context, w Response) { w.Fail(fmt.Errorf("db down")) },
+		}
+	})
+	m, ms := newMuxWithMock(t, cmd)
+	payload := basicConfirmPayload(ms.ResponseURL(), "/delete-user", "U1", "alice", map[string]any{
+		"args": map[string]any{}, "set": []any{}, "invoker": "U1", "invoked_at": "2026-04-29T10:00:00Z",
+	})
+	req := mockslack.SignedInteractionRequest(t, "test-secret", payload)
+	w := httptest.NewRecorder()
+	m.InteractionHandler().ServeHTTP(w, req)
+	calls := ms.WaitFor(1, 2*time.Second)
+	// must NOT include a response_url replace_original call
+	for _, c := range calls {
+		if strings.Contains(c.URL, "/response/") {
+			if c.Body["replace_original"] == true {
+				t.Fatalf("button should not be stripped on failure")
+			}
+		}
+	}
+	// thread reply must contain the err
+	var thread *mockslack.Call
+	for i := range calls {
+		if strings.Contains(calls[i].URL, "chat.postMessage") {
+			thread = &calls[i]
+		}
+	}
+	if thread == nil {
+		t.Fatal("missing thread reply")
+	}
+	if !strings.Contains(flattenBlocksText(thread.Body["blocks"].([]any)), "db down") {
+		t.Fatalf("err missing in thread: %v", thread.Body)
+	}
+}
+
+func TestInteractionExecutePanicRecovers(t *testing.T) {
+	cmd := New("/delete-user", "", func(fs *flag.FlagSet) Handlers {
+		return Handlers{
+			Preview: func(ctx context.Context, w Response) {},
+			Execute: func(ctx context.Context, w Response) { panic("oops") },
+		}
+	})
+	m, ms := newMuxWithMock(t, cmd)
+	payload := basicConfirmPayload(ms.ResponseURL(), "/delete-user", "U1", "alice", map[string]any{
+		"args": map[string]any{}, "set": []any{}, "invoker": "U1", "invoked_at": "2026-04-29T10:00:00Z",
+	})
+	req := mockslack.SignedInteractionRequest(t, "test-secret", payload)
+	w := httptest.NewRecorder()
+	m.InteractionHandler().ServeHTTP(w, req) // must not crash
+	calls := ms.WaitFor(1, 2*time.Second)
+	var thread *mockslack.Call
+	for i := range calls {
+		if strings.Contains(calls[i].URL, "chat.postMessage") {
+			thread = &calls[i]
+		}
+	}
+	if thread == nil {
+		t.Fatal("expected thread reply on panic")
+	}
+	if !strings.Contains(flattenBlocksText(thread.Body["blocks"].([]any)), "panic: oops") {
+		t.Fatalf("panic err missing: %v", thread.Body)
+	}
+}
+
+func TestInteractionConfirmByNonInvoker(t *testing.T) {
+	cmd := New("/delete-user", "", func(fs *flag.FlagSet) Handlers {
+		return Handlers{
+			Preview: func(ctx context.Context, w Response) {},
+			Execute: func(ctx context.Context, w Response) { fmt.Fprint(w, "should not run") },
+		}
+	})
+	m, ms := newMuxWithMock(t, cmd)
+	payload := basicConfirmPayload(ms.ResponseURL(), "/delete-user", "U2", "bob", map[string]any{
+		"args": map[string]any{}, "set": []any{}, "invoker": "U1", "invoked_at": "2026-04-29T10:00:00Z",
+	})
+	req := mockslack.SignedInteractionRequest(t, "test-secret", payload)
+	w := httptest.NewRecorder()
+	m.InteractionHandler().ServeHTTP(w, req)
+	calls := ms.WaitFor(1, 2*time.Second)
+	if calls[0].Body["response_type"] != "ephemeral" {
+		t.Fatalf("expected ephemeral lock msg")
+	}
+	for _, c := range calls {
+		if strings.Contains(c.URL, "chat.postMessage") {
+			t.Fatalf("Execute must not run for non-invoker")
+		}
+	}
+}
+
+func TestInteractionCancel(t *testing.T) {
+	cmd := New("/delete-user", "", func(fs *flag.FlagSet) Handlers {
+		return Handlers{
+			Preview: func(ctx context.Context, w Response) {},
+			Execute: func(ctx context.Context, w Response) { fmt.Fprint(w, "should not run") },
+		}
+	})
+	m, ms := newMuxWithMock(t, cmd)
+	payload := basicConfirmPayload(ms.ResponseURL(), "/delete-user", "U1", "alice", map[string]any{
+		"args": map[string]any{}, "set": []any{}, "invoker": "U1", "invoked_at": "2026-04-29T10:00:00Z",
+	})
+	payload["actions"] = []any{
+		map[string]any{"action_id": "slackflag.cancel", "value": "/delete-user"},
+	}
+	req := mockslack.SignedInteractionRequest(t, "test-secret", payload)
+	w := httptest.NewRecorder()
+	m.InteractionHandler().ServeHTTP(w, req)
+	calls := ms.WaitFor(1, 2*time.Second)
+	var update *mockslack.Call
+	for i := range calls {
+		if strings.Contains(calls[i].URL, "/response/") && calls[i].Body["replace_original"] == true {
+			update = &calls[i]
+		}
+	}
+	if update == nil {
+		t.Fatal("expected replace_original update on cancel")
+	}
+	if !strings.Contains(flattenBlocksText(update.Body["blocks"].([]any)), "cancelled by <@alice>") {
+		t.Fatalf("cancel footer missing: %v", update.Body)
+	}
+}
+
+// basicConfirmPayload builds a minimal block_actions payload mirroring what
+// Slack would POST when a user clicks Confirm on a slackflag preview.
+func basicConfirmPayload(respURL, cmdName, userID, userName string, eventPayload map[string]any) map[string]any {
+	return map[string]any{
+		"type":    "block_actions",
+		"user":    map[string]any{"id": userID, "name": userName},
+		"channel": map[string]any{"id": "C1"},
+		"actions": []any{
+			map[string]any{"action_id": "slackflag.confirm", "value": cmdName},
+		},
+		"message": map[string]any{
+			"ts": "1714000000.001",
+			"blocks": []any{
+				map[string]any{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": "preview"}},
+				map[string]any{"type": "actions"},
+			},
+			"metadata": map[string]any{
+				"event_type":    "slackflag",
+				"event_payload": eventPayload,
+			},
+		},
+		"response_url": respURL,
+	}
+}
