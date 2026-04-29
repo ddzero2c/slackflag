@@ -249,14 +249,126 @@ func actionsBlock(cmdName string) Block {
 }
 
 func (m *Mux) serveInteraction(w http.ResponseWriter, r *http.Request) {
-	_, err := m.readAndVerify(r)
+	body, err := m.readAndVerify(r)
 	if err != nil {
 		m.logger.Warn("interaction signature invalid", "err", err)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	// TODO: filled in Task 12+
+	form, err := url.ParseQuery(string(body))
+	if err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	var payload struct {
+		Type    string `json:"type"`
+		User    struct{ ID, Name string } `json:"user"`
+		Channel struct{ ID string }       `json:"channel"`
+		Actions []struct {
+			ActionID string `json:"action_id"`
+			Value    string `json:"value"`
+		} `json:"actions"`
+		Message struct {
+			TS       string          `json:"ts"`
+			Blocks   []any           `json:"blocks"`
+			Metadata struct {
+				EventType    string          `json:"event_type"`
+				EventPayload json.RawMessage `json:"event_payload"`
+			} `json:"metadata"`
+		} `json:"message"`
+		ResponseURL string `json:"response_url"`
+	}
+	if err := json.Unmarshal([]byte(form.Get("payload")), &payload); err != nil {
+		http.Error(w, "bad payload", http.StatusBadRequest)
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
+
+	m.asyncRun(r.Context(), "interact", func() {
+		if len(payload.Actions) == 0 {
+			return
+		}
+		action := payload.Actions[0]
+		md, _ := unmarshalMetadata(payload.Message.Metadata.EventPayload)
+
+		// only original invoker may confirm or cancel
+		if payload.User.ID != md.Invoker {
+			m.postEphemeral(payload.ResponseURL, []Block{
+				Section(fmt.Sprintf(":lock: only <@%s> can act on this command", md.Invoker)),
+			})
+			return
+		}
+
+		switch action.ActionID {
+		case "slackflag.cancel":
+			m.finalizePreview(payload.ResponseURL, payload.Message.Blocks,
+				fmt.Sprintf(":no_entry_sign: cancelled by <@%s> at %s",
+					payload.User.Name, m.now().Format("2006-01-02 15:04 MST")))
+			return
+		case "slackflag.confirm":
+			cmd := m.lookup(action.Value)
+			if cmd == nil {
+				m.postEphemeral(payload.ResponseURL, []Block{Section(":x: unknown command: " + action.Value)})
+				return
+			}
+			fs := flag.NewFlagSet(cmd.Name, flag.ContinueOnError)
+			h := cmd.build(fs)
+			if err := replayMetadata(fs, md); err != nil {
+				m.postThread(payload.Channel.ID, payload.Message.TS,
+					[]Block{Section(":x: " + err.Error())})
+				return
+			}
+			ctx := context.Background()
+			resp := newResponse()
+			safeRun(m.logger, "execute "+cmd.Name, func() {
+				h.Execute(ctx, resp)
+			}, resp)
+			threadBlocks := resp.flushBlocks()
+			m.postThread(payload.Channel.ID, payload.Message.TS, threadBlocks)
+			if resp.failed {
+				// keep button alive — do NOT replace_original
+				return
+			}
+			m.finalizePreview(payload.ResponseURL, payload.Message.Blocks,
+				fmt.Sprintf(":white_check_mark: executed by <@%s> at %s",
+					payload.User.Name, m.now().Format("2006-01-02 15:04 MST")))
+		default:
+			m.logger.Warn("unknown action_id", "id", action.ActionID)
+		}
+	})
+}
+
+// finalizePreview replaces the original preview message: strips actions blocks,
+// appends a footer line.
+func (m *Mux) finalizePreview(respURL string, original []any, footerText string) {
+	stripped := stripActions(original)
+	stripped = append(stripped, Section(footerText))
+	if err := m.client.postResponseURL(context.Background(), respURL, map[string]any{
+		"replace_original": true,
+		"blocks":           stripped,
+	}); err != nil {
+		m.logger.Warn("finalize preview failed", "err", err)
+	}
+}
+
+// postThread fires a chat.postMessage as a thread reply.
+func (m *Mux) postThread(channel, threadTS string, blocks []Block) {
+	if err := m.client.chatPostMessage(context.Background(), channel, threadTS, blocks); err != nil {
+		m.logger.Error("chat.postMessage failed", "err", err)
+	}
+}
+
+// stripActions returns the blocks list without any "actions" blocks.
+func stripActions(blocks []any) []Block {
+	out := make([]Block, 0, len(blocks))
+	for _, b := range blocks {
+		if bm, ok := b.(map[string]any); ok && bm["type"] == "actions" {
+			continue
+		}
+		out = append(out, b)
+	}
+	return out
 }
 
 // asyncRun runs fn in a goroutine with panic recovery, logging panics.

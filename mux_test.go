@@ -271,5 +271,75 @@ func flattenBlocksText(blocks []any) string {
 	return sb.String()
 }
 
+func TestInteractionConfirmSuccess(t *testing.T) {
+	cmd := New("/delete-user", "", func(fs *flag.FlagSet) Handlers {
+		id := fs.String("id", "", "")
+		return Handlers{
+			Preview: func(ctx context.Context, w Response) { fmt.Fprintf(w, "preview %s", *id) },
+			Execute: func(ctx context.Context, w Response) {
+				fmt.Fprintf(w, "deleted %s", *id)
+			},
+		}
+	})
+	m, ms := newMuxWithMock(t, cmd)
+
+	payload := map[string]any{
+		"type": "block_actions",
+		"user": map[string]any{"id": "U1", "name": "alice"},
+		"channel": map[string]any{"id": "C1"},
+		"actions": []any{
+			map[string]any{"action_id": "slackflag.confirm", "value": "/delete-user"},
+		},
+		"message": map[string]any{
+			"ts":     "1714000000.001",
+			"blocks": []any{map[string]any{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": "preview u1"}}, map[string]any{"type": "actions"}},
+			"metadata": map[string]any{
+				"event_type": "slackflag",
+				"event_payload": map[string]any{
+					"args":       map[string]any{"id": "u1"},
+					"set":        []any{"id"},
+					"invoker":    "U1",
+					"invoked_at": "2026-04-29T10:00:00Z",
+				},
+			},
+		},
+		"response_url": ms.ResponseURL(),
+	}
+	req := mockslack.SignedInteractionRequest(t, "test-secret", payload)
+	w := httptest.NewRecorder()
+	m.InteractionHandler().ServeHTTP(w, req)
+	calls := ms.WaitFor(2, 2*time.Second) // expect: thread post + response_url update
+
+	var threadCall, updateCall *mockslack.Call
+	for i := range calls {
+		if strings.Contains(calls[i].URL, "chat.postMessage") {
+			threadCall = &calls[i]
+		} else if strings.Contains(calls[i].URL, "/response/") {
+			updateCall = &calls[i]
+		}
+	}
+	if threadCall == nil || updateCall == nil {
+		t.Fatalf("missing call: thread=%v update=%v calls=%v", threadCall, updateCall, calls)
+	}
+	if threadCall.Body["thread_ts"] != "1714000000.001" {
+		t.Fatalf("thread_ts: %v", threadCall.Body["thread_ts"])
+	}
+	threadText := flattenBlocksText(threadCall.Body["blocks"].([]any))
+	if !strings.Contains(threadText, "deleted u1") {
+		t.Fatalf("thread reply: %s", threadText)
+	}
+
+	updateText := flattenBlocksText(updateCall.Body["blocks"].([]any))
+	if strings.Contains(updateText, "Confirm") || strings.Contains(updateText, "Cancel") {
+		t.Fatalf("buttons should be stripped: %s", updateText)
+	}
+	if !strings.Contains(updateText, "executed by <@alice>") {
+		t.Fatalf("footer missing: %s", updateText)
+	}
+	if updateCall.Body["replace_original"] != true {
+		t.Fatalf("replace_original missing")
+	}
+}
+
 // errFakeNotFound is a stable error for tests asserting on Fail behavior.
 var errFakeNotFound = fmt.Errorf("user not found")
