@@ -172,10 +172,12 @@ func (m *Mux) serveSlash(w http.ResponseWriter, r *http.Request) {
 			footer := Section(fmt.Sprintf("%s ran by <@%s> at %s",
 				marker, userName, m.now().Format("2006-01-02 15:04 MST")))
 			blocks := append(execResp.flushBlocks(), footer)
-			_ = m.client.postResponseURL(ctx, respURL, map[string]any{
+			if err := m.client.postResponseURL(ctx, respURL, map[string]any{
 				"response_type": "in_channel",
 				"blocks":        blocks,
-			})
+			}); err != nil {
+				m.logger.Warn("response_url post failed", "label", "slash:"+cmd.Name, "err", err)
+			}
 			return
 		}
 
@@ -185,16 +187,17 @@ func (m *Mux) serveSlash(w http.ResponseWriter, r *http.Request) {
 		blocks := append(resp.flushBlocks(),
 			actionsBlock(cmd.Name),
 		)
-		_ = m.client.postResponseURL(ctx, respURL, map[string]any{
+		if err := m.client.postResponseURL(ctx, respURL, map[string]any{
 			"response_type": "in_channel",
 			"blocks":        blocks,
 			"metadata": map[string]any{
 				"event_type":    "slackflag",
 				"event_payload": json.RawMessage(mdRaw),
 			},
-		})
-		_ = channelID // reserved for future use; not needed for response_url path
-		_ = userName
+		}); err != nil {
+			m.logger.Warn("response_url post failed", "label", "slash:"+cmd.Name, "err", err)
+		}
+		_ = channelID // reserved for chat.postMessage thread reply in interaction flow
 	})
 }
 
@@ -203,10 +206,12 @@ func (m *Mux) postEphemeral(respURL string, blocks []Block) {
 	if respURL == "" {
 		return
 	}
-	_ = m.client.postResponseURL(context.Background(), respURL, map[string]any{
+	if err := m.client.postResponseURL(context.Background(), respURL, map[string]any{
 		"response_type": "ephemeral",
 		"blocks":        blocks,
-	})
+	}); err != nil {
+		m.logger.Warn("ephemeral post failed", "err", err)
+	}
 }
 
 // safeRun wraps a handler invocation with panic recovery.
