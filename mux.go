@@ -146,6 +146,13 @@ func (m *Mux) serveSlash(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if h.Validate != nil {
+			if err := h.Validate(); err != nil {
+				m.postEphemeral(respURL, []Block{Section(":x: " + err.Error())})
+				return
+			}
+		}
+
 		ctx := context.Background()
 		resp := newResponse()
 		safeRun(m.logger, "preview "+cmd.Name, func() {
@@ -183,7 +190,12 @@ func (m *Mux) serveSlash(w http.ResponseWriter, r *http.Request) {
 
 		// Confirm flow: post preview with Confirm/Cancel buttons + metadata.
 		md := encodeMetadata(fs, userID, m.now().UTC().Format(time.RFC3339))
-		mdRaw, _ := md.marshal()
+		mdRaw, err := md.marshal()
+		if err != nil {
+			m.logger.Error("metadata marshal failed", "cmd", cmd.Name, "err", err)
+			m.postEphemeral(respURL, []Block{Section(":x: internal error, please try again")})
+			return
+		}
 		blocks := append(resp.flushBlocks(),
 			actionsBlock(cmd.Name),
 		)
@@ -290,7 +302,14 @@ func (m *Mux) serveInteraction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		action := payload.Actions[0]
-		md, _ := unmarshalMetadata(payload.Message.Metadata.EventPayload)
+		md, err := unmarshalMetadata(payload.Message.Metadata.EventPayload)
+		if err != nil {
+			m.logger.Warn("interaction metadata invalid", "err", err)
+			m.postEphemeral(payload.ResponseURL, []Block{
+				Section(":x: could not read command metadata, please re-run the command"),
+			})
+			return
+		}
 
 		// only original invoker may confirm or cancel
 		if payload.User.ID != md.Invoker {

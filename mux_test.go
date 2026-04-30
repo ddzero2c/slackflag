@@ -493,6 +493,85 @@ func basicConfirmPayload(respURL, cmdName, userID, userName string, eventPayload
 	}
 }
 
+func TestSlashValidateFail(t *testing.T) {
+	cmd := New("/foo", "", func(fs *flag.FlagSet) Handlers {
+		return Handlers{
+			Validate: func() error { return fmt.Errorf("id is required") },
+			Preview:  func(ctx context.Context, w Response) { t.Fatal("Preview must not run") },
+			Execute:  func(ctx context.Context, w Response) { t.Fatal("Execute must not run") },
+		}
+	})
+	m, ms := newMuxWithMock(t, cmd)
+	req := mockslack.SignedSlashRequest(t, "test-secret", "/foo", "", "U1", "alice", "C1", ms.ResponseURL())
+	w := httptest.NewRecorder()
+	m.SlashHandler().ServeHTTP(w, req)
+	calls := ms.WaitFor(1, time.Second)
+	if calls[0].Body["response_type"] != "ephemeral" {
+		t.Fatalf("expected ephemeral on validate fail, got %v", calls[0].Body["response_type"])
+	}
+	rendered := flattenBlocksText(calls[0].Body["blocks"].([]any))
+	if !strings.Contains(rendered, "id is required") {
+		t.Fatalf("expected error text in blocks, got: %s", rendered)
+	}
+}
+
+func TestSlashValidatePassDirectFlow(t *testing.T) {
+	cmd := New("/foo", "", func(fs *flag.FlagSet) Handlers {
+		id := fs.String("id", "", "")
+		return Handlers{
+			Validate: func() error { return nil },
+			Execute: func(ctx context.Context, w Response) {
+				fmt.Fprintf(w, "ran for %s", *id)
+			},
+		}
+	})
+	m, ms := newMuxWithMock(t, cmd)
+	req := mockslack.SignedSlashRequest(t, "test-secret", "/foo", "-id u1", "U1", "alice", "C1", ms.ResponseURL())
+	w := httptest.NewRecorder()
+	m.SlashHandler().ServeHTTP(w, req)
+	calls := ms.WaitFor(1, time.Second)
+	if calls[0].Body["response_type"] != "in_channel" {
+		t.Fatalf("expected in_channel after validate passes, got %v", calls[0].Body["response_type"])
+	}
+	if !strings.Contains(flattenBlocksText(calls[0].Body["blocks"].([]any)), "ran for u1") {
+		t.Fatalf("expected execute output")
+	}
+}
+
+func TestInteractionCorruptMetadata(t *testing.T) {
+	cmd := New("/delete-user", "", func(fs *flag.FlagSet) Handlers {
+		return Handlers{
+			Preview: func(ctx context.Context, w Response) {},
+			Execute: func(ctx context.Context, w Response) { t.Fatal("Execute must not run on corrupt metadata") },
+		}
+	})
+	m, ms := newMuxWithMock(t, cmd)
+	payload := map[string]any{
+		"type":    "block_actions",
+		"user":    map[string]any{"id": "U1", "name": "alice"},
+		"channel": map[string]any{"id": "C1"},
+		"actions": []any{
+			map[string]any{"action_id": "slackflag.confirm", "value": "/delete-user"},
+		},
+		"message": map[string]any{
+			"ts":     "1714000000.001",
+			"blocks": []any{},
+			"metadata": map[string]any{
+				"event_type":    "slackflag",
+				"event_payload": "this is not a valid metadata object",
+			},
+		},
+		"response_url": ms.ResponseURL(),
+	}
+	req := mockslack.SignedInteractionRequest(t, "test-secret", payload)
+	w := httptest.NewRecorder()
+	m.InteractionHandler().ServeHTTP(w, req)
+	calls := ms.WaitFor(1, 2*time.Second)
+	if calls[0].Body["response_type"] != "ephemeral" {
+		t.Fatalf("expected ephemeral for corrupt metadata, got %v", calls[0].Body["response_type"])
+	}
+}
+
 func TestSlashConcurrentInvocations(t *testing.T) {
 	cmd := New("/foo", "", func(fs *flag.FlagSet) Handlers {
 		id := fs.String("id", "", "")

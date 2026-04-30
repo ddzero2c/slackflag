@@ -7,12 +7,14 @@ import (
 	"strings"
 )
 
-// Handlers carries the user-defined Preview and Execute callbacks.
-// Preview is optional: a nil Preview switches the command to direct flow,
-// where Execute runs immediately on slash invocation.
+// Handlers carries the user-defined callbacks for a command.
+// Validate and Preview are optional. A nil Preview switches to direct flow
+// (Execute runs immediately). Validate runs after flag parsing; a non-nil
+// error is sent as an ephemeral and stops further execution.
 type Handlers struct {
-	Preview func(ctx context.Context, w Response)
-	Execute func(ctx context.Context, w Response)
+	Validate func() error
+	Preview  func(ctx context.Context, w Response)
+	Execute  func(ctx context.Context, w Response)
 }
 
 // Command is a single slash command registration.

@@ -17,11 +17,13 @@ func deleteUserCmd() *slackflag.Command {
 			id := fs.String("id", "", "user id")
 			force := fs.Bool("force", false, "skip safety checks")
 			return slackflag.Handlers{
-				Preview: func(ctx context.Context, w slackflag.Response) {
+				Validate: func() error {
 					if *id == "" {
-						w.Fail(fmt.Errorf("-id is required"))
-						return
+						return fmt.Errorf("-id is required")
 					}
+					return nil
+				},
+				Preview: func(ctx context.Context, w slackflag.Response) {
 					fmt.Fprintf(w, "about to delete user=%s force=%v", *id, *force)
 				},
 				Execute: func(ctx context.Context, w slackflag.Response) {
