@@ -1,6 +1,7 @@
 package slackflag
 
 import (
+	"encoding/json"
 	"flag"
 	"reflect"
 	"sort"
@@ -20,7 +21,7 @@ func TestMetadataRoundTrip(t *testing.T) {
 	_ = n
 	_ = force
 
-	m := encodeMetadata(fs, "U001", "2026-04-29T10:00:00Z")
+	m := encodeMetadata(fs, nil, "U001", "2026-04-29T10:00:00Z")
 	if m.Args["id"] != "u1" || m.Args["n"] != "5" || m.Args["force"] != "true" {
 		t.Fatalf("Args: %#v", m.Args)
 	}
@@ -65,6 +66,7 @@ func TestMetadataMarshalRoundTrip(t *testing.T) {
 	m := metadata{
 		Args:      map[string]string{"id": "u1"},
 		Set:       []string{"id"},
+		Sub:       []string{"user-create"},
 		Invoker:   "U1",
 		InvokedAt: "2026-04-29T10:00:00Z",
 	}
@@ -78,5 +80,53 @@ func TestMetadataMarshalRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(m, got) {
 		t.Fatalf("got %#v want %#v", got, m)
+	}
+}
+
+func TestMetadataSubPathRoundTrip(t *testing.T) {
+	fs := flag.NewFlagSet("/admin user-create", flag.ContinueOnError)
+	fs.String("name", "", "")
+	if err := fs.Parse([]string{"-name=alice"}); err != nil {
+		t.Fatal(err)
+	}
+	m := encodeMetadata(fs, []string{"user-create"}, "U1", "2026-04-29T10:00:00Z")
+	if !reflect.DeepEqual(m.Sub, []string{"user-create"}) {
+		t.Fatalf("Sub: %#v", m.Sub)
+	}
+	raw, err := m.marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"sub":["user-create"]`) {
+		t.Fatalf("expected sub field in JSON, got: %s", raw)
+	}
+}
+
+func TestMetadataAbsentSubBackwardCompat(t *testing.T) {
+	// Old payloads written before subcommand support omit "sub".
+	raw := json.RawMessage(`{"args":{"id":"u1"},"set":["id"],"invoker":"U1","invoked_at":"2026-04-29T10:00:00Z"}`)
+	got, err := unmarshalMetadata(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Sub != nil {
+		t.Fatalf("expected nil Sub for old payload, got %#v", got.Sub)
+	}
+	if got.Invoker != "U1" || got.Args["id"] != "u1" {
+		t.Fatalf("decoded payload: %#v", got)
+	}
+}
+
+func TestMetadataEmptySubOmitted(t *testing.T) {
+	// encoded metadata with no subcommand path should not emit a "sub" key,
+	// keeping payloads compact for single-command users.
+	fs := flag.NewFlagSet("/foo", flag.ContinueOnError)
+	m := encodeMetadata(fs, nil, "U1", "2026-04-29T10:00:00Z")
+	raw, err := m.marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"sub"`) {
+		t.Fatalf("unexpected sub field: %s", raw)
 	}
 }

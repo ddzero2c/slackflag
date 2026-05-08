@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -61,6 +62,9 @@ func NewMux(cfg Config) *Mux {
 }
 
 func (m *Mux) Register(cmd *Command) {
+	if !strings.HasPrefix(cmd.Name, "/") {
+		panic(fmt.Sprintf("slackflag.Register: top-level command name %q must start with /", cmd.Name))
+	}
 	cmd.validateHandlers()
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -127,15 +131,42 @@ func (m *Mux) serveSlash(w http.ResponseWriter, r *http.Request) {
 			m.postEphemeral(respURL, []Block{Section(":x: unknown command: " + cmdName)})
 			return
 		}
-		fs := flag.NewFlagSet(cmd.Name, flag.ContinueOnError)
-		var usageBuf bytes.Buffer
-		fs.SetOutput(&usageBuf)
-		h := cmd.build(fs)
 		args, terr := tokenize(text)
 		if terr != nil {
 			m.postEphemeral(respURL, []Block{Section(":x: tokenize: " + terr.Error())})
 			return
 		}
+
+		// Walk subcommand path. Branch commands have build == nil; resolve the
+		// first positional token to a subcommand until we reach a leaf, then
+		// hand the remaining args to the leaf's FlagSet.
+		target := cmd
+		var subPath []string
+		for len(target.subs) > 0 {
+			if len(args) == 0 {
+				m.renderHelp(respURL, cmd, target, subPath)
+				return
+			}
+			head := args[0]
+			if head == "help" || head == "-h" || head == "--help" {
+				m.renderHelp(respURL, cmd, target, subPath)
+				return
+			}
+			sub, ok := target.subs[head]
+			if !ok {
+				m.renderUnknownSub(respURL, cmd, target, subPath, head)
+				return
+			}
+			subPath = append(subPath, head)
+			target = sub
+			args = args[1:]
+		}
+
+		label := cmdLabel(cmd, subPath)
+		fs := flag.NewFlagSet(label, flag.ContinueOnError)
+		var usageBuf bytes.Buffer
+		fs.SetOutput(&usageBuf)
+		h := target.build(fs)
 		if err := fs.Parse(args); err != nil {
 			fs.Usage()
 			usage := usageBuf.String()
@@ -155,7 +186,7 @@ func (m *Mux) serveSlash(w http.ResponseWriter, r *http.Request) {
 
 		ctx := context.Background()
 		resp := newResponse()
-		safeRun(m.logger, "preview "+cmd.Name, func() {
+		safeRun(m.logger, "preview "+label, func() {
 			if h.Preview != nil {
 				h.Preview(ctx, resp)
 			}
@@ -169,7 +200,7 @@ func (m *Mux) serveSlash(w http.ResponseWriter, r *http.Request) {
 		if h.Preview == nil {
 			// Direct flow: Execute and post in_channel.
 			execResp := newResponse()
-			safeRun(m.logger, "execute "+cmd.Name, func() {
+			safeRun(m.logger, "execute "+label, func() {
 				h.Execute(ctx, execResp)
 			}, execResp)
 			marker := ":white_check_mark:"
@@ -183,16 +214,19 @@ func (m *Mux) serveSlash(w http.ResponseWriter, r *http.Request) {
 				"response_type": "in_channel",
 				"blocks":        blocks,
 			}); err != nil {
-				m.logger.Warn("response_url post failed", "label", "slash:"+cmd.Name, "err", err)
+				m.logger.Warn("response_url post failed", "label", "slash:"+label, "err", err)
 			}
 			return
 		}
 
 		// Confirm flow: post preview with Confirm/Cancel buttons + metadata.
-		md := encodeMetadata(fs, userID, m.now().UTC().Format(time.RFC3339))
+		// The button stores the top-level cmd.Name; the subcommand path is
+		// recorded in metadata so the interaction handler can walk back to
+		// the right *Command.
+		md := encodeMetadata(fs, subPath, userID, m.now().UTC().Format(time.RFC3339))
 		mdRaw, err := md.marshal()
 		if err != nil {
-			m.logger.Error("metadata marshal failed", "cmd", cmd.Name, "err", err)
+			m.logger.Error("metadata marshal failed", "cmd", label, "err", err)
 			m.postEphemeral(respURL, []Block{Section(":x: internal error, please try again")})
 			return
 		}
@@ -207,7 +241,7 @@ func (m *Mux) serveSlash(w http.ResponseWriter, r *http.Request) {
 				"event_payload": json.RawMessage(mdRaw),
 			},
 		}); err != nil {
-			m.logger.Warn("response_url post failed", "label", "slash:"+cmd.Name, "err", err)
+			m.logger.Warn("response_url post failed", "label", "slash:"+label, "err", err)
 		}
 		_ = channelID // reserved for chat.postMessage thread reply in interaction flow
 	})
@@ -331,8 +365,24 @@ func (m *Mux) serveInteraction(w http.ResponseWriter, r *http.Request) {
 				m.postEphemeral(payload.ResponseURL, []Block{Section(":x: unknown command: " + action.Value)})
 				return
 			}
-			fs := flag.NewFlagSet(cmd.Name, flag.ContinueOnError)
-			h := cmd.build(fs)
+			target := cmd
+			for _, name := range md.Sub {
+				sub, ok := target.subs[name]
+				if !ok {
+					m.postThread(payload.Channel.ID, payload.Message.TS,
+						[]Block{Section(fmt.Sprintf(":x: subcommand %q no longer exists (configuration drift)", name))})
+					return
+				}
+				target = sub
+			}
+			if target.build == nil {
+				m.postThread(payload.Channel.ID, payload.Message.TS,
+					[]Block{Section(":x: cannot execute branch command without leaf subcommand")})
+				return
+			}
+			label := cmdLabel(cmd, md.Sub)
+			fs := flag.NewFlagSet(label, flag.ContinueOnError)
+			h := target.build(fs)
 			if err := replayMetadata(fs, md); err != nil {
 				m.postThread(payload.Channel.ID, payload.Message.TS,
 					[]Block{Section(":x: " + err.Error())})
@@ -340,7 +390,7 @@ func (m *Mux) serveInteraction(w http.ResponseWriter, r *http.Request) {
 			}
 			ctx := context.Background()
 			resp := newResponse()
-			safeRun(m.logger, "execute "+cmd.Name, func() {
+			safeRun(m.logger, "execute "+label, func() {
 				h.Execute(ctx, resp)
 			}, resp)
 			threadBlocks := resp.flushBlocks()
@@ -400,4 +450,51 @@ func (m *Mux) asyncRun(ctx context.Context, label string, fn func()) {
 		}()
 		fn()
 	}()
+}
+
+// cmdLabel returns the human-readable label for a command path,
+// e.g. "/admin user-create".
+func cmdLabel(top *Command, subPath []string) string {
+	if len(subPath) == 0 {
+		return top.Name
+	}
+	return top.Name + " " + strings.Join(subPath, " ")
+}
+
+// renderHelp posts an ephemeral listing target's subcommands.
+func (m *Mux) renderHelp(respURL string, top *Command, target *Command, subPath []string) {
+	var b strings.Builder
+	label := cmdLabel(top, subPath)
+	if target.Description != "" {
+		fmt.Fprintf(&b, "*%s* — %s\n\n", label, target.Description)
+	} else {
+		fmt.Fprintf(&b, "*%s*\n\n", label)
+	}
+	b.WriteString("Available subcommands:\n")
+	b.WriteString(formatSubList(target))
+	m.postEphemeral(respURL, []Block{Section(b.String())})
+}
+
+// renderUnknownSub posts an ephemeral when a positional token doesn't match
+// any subcommand of target.
+func (m *Mux) renderUnknownSub(respURL string, top *Command, target *Command, subPath []string, name string) {
+	var b strings.Builder
+	fmt.Fprintf(&b, ":x: unknown subcommand `%s`\n\n", name)
+	fmt.Fprintf(&b, "Available subcommands for *%s*:\n", cmdLabel(top, subPath))
+	b.WriteString(formatSubList(target))
+	m.postEphemeral(respURL, []Block{Section(b.String())})
+}
+
+// formatSubList renders one line per direct subcommand in registration order.
+func formatSubList(target *Command) string {
+	var b strings.Builder
+	for _, name := range target.subOrder {
+		sub := target.subs[name]
+		if sub.Description != "" {
+			fmt.Fprintf(&b, "• `%s` — %s\n", name, sub.Description)
+		} else {
+			fmt.Fprintf(&b, "• `%s`\n", name)
+		}
+	}
+	return b.String()
 }

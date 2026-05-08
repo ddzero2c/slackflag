@@ -46,6 +46,50 @@ func userStatsCmd() *slackflag.Command {
 		})
 }
 
+// adminCmd shows the subcommand pattern: a single /admin slash registration
+// hosts multiple operations as subcommands. /admin alone (or /admin -h)
+// renders an auto-generated list of available subcommands.
+func adminCmd() *slackflag.Command {
+	admin := slackflag.New("/admin", "internal admin tools", nil)
+
+	admin.AddSubcommand(slackflag.New("user-create", "create a user (confirm flow)",
+		func(fs *flag.FlagSet) slackflag.Handlers {
+			name := fs.String("name", "", "user name")
+			role := fs.String("role", "viewer", "user role")
+			return slackflag.Handlers{
+				Validate: func() error {
+					if *name == "" {
+						return fmt.Errorf("-name is required")
+					}
+					return nil
+				},
+				Preview: func(ctx context.Context, w slackflag.Response) {
+					fmt.Fprintf(w, "about to create user=%s role=%s", *name, *role)
+				},
+				Execute: func(ctx context.Context, w slackflag.Response) {
+					fmt.Fprintf(w, "(demo) created user=%s role=%s", *name, *role)
+				},
+			}
+		}))
+
+	admin.AddSubcommand(slackflag.New("feature-flag", "toggle a feature flag (direct flow)",
+		func(fs *flag.FlagSet) slackflag.Handlers {
+			name := fs.String("name", "", "flag name")
+			on := fs.Bool("on", false, "enable the flag")
+			return slackflag.Handlers{
+				Execute: func(ctx context.Context, w slackflag.Response) {
+					state := "off"
+					if *on {
+						state = "on"
+					}
+					fmt.Fprintf(w, "(demo) feature %s set %s", *name, state)
+				},
+			}
+		}))
+
+	return admin
+}
+
 func newServer(secret, token, slackBaseURL string) http.Handler {
 	mux := slackflag.NewMux(slackflag.Config{
 		SigningSecret: secret,
@@ -54,6 +98,7 @@ func newServer(secret, token, slackBaseURL string) http.Handler {
 	})
 	mux.Register(deleteUserCmd())
 	mux.Register(userStatsCmd())
+	mux.Register(adminCmd())
 	root := http.NewServeMux()
 	root.Handle("/slack/command", mux.SlashHandler())
 	root.Handle("/slack/interact", mux.InteractionHandler())

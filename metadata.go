@@ -7,16 +7,21 @@ import (
 )
 
 // metadata is what we store in Slack message metadata.event_payload.
+// Sub records the subcommand path (e.g. ["user-create"]) so the Confirm
+// handler can walk back to the right *Command and rebuild its FlagSet.
+// Stored as a list so nested subcommands can extend it without a schema bump.
 type metadata struct {
 	Args      map[string]string `json:"args"`
 	Set       []string          `json:"set"`
+	Sub       []string          `json:"sub,omitempty"`
 	Invoker   string            `json:"invoker"`
 	InvokedAt string            `json:"invoked_at"`
 }
 
-func encodeMetadata(fs *flag.FlagSet, invoker, invokedAt string) metadata {
+func encodeMetadata(fs *flag.FlagSet, sub []string, invoker, invokedAt string) metadata {
 	m := metadata{
 		Args:      map[string]string{},
+		Sub:       append([]string(nil), sub...),
 		Invoker:   invoker,
 		InvokedAt: invokedAt,
 	}

@@ -572,6 +572,236 @@ func TestInteractionCorruptMetadata(t *testing.T) {
 	}
 }
 
+func TestRegisterRequiresLeadingSlash(t *testing.T) {
+	m := NewMux(Config{SigningSecret: "s", BotToken: "xoxb-x"})
+	cmd := New("foo", "", func(fs *flag.FlagSet) Handlers {
+		return Handlers{Execute: func(ctx context.Context, w Response) {}}
+	})
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic on top-level command without leading /")
+		}
+	}()
+	m.Register(cmd)
+}
+
+// adminCmd builds a /admin parent with two subs: user-create (confirm flow)
+// and user-stats (direct flow). Used by several subcommand tests.
+func adminCmd() *Command {
+	parent := New("/admin", "admin tools", nil)
+	parent.AddSubcommand(New("user-create", "create a user",
+		func(fs *flag.FlagSet) Handlers {
+			name := fs.String("name", "", "user name")
+			return Handlers{
+				Validate: func() error {
+					if *name == "" {
+						return fmt.Errorf("-name is required")
+					}
+					return nil
+				},
+				Preview: func(ctx context.Context, w Response) {
+					fmt.Fprintf(w, "about to create %s", *name)
+				},
+				Execute: func(ctx context.Context, w Response) {
+					fmt.Fprintf(w, "created %s", *name)
+				},
+			}
+		}))
+	parent.AddSubcommand(New("user-stats", "show user stats (direct)",
+		func(fs *flag.FlagSet) Handlers {
+			team := fs.String("team", "", "team")
+			return Handlers{
+				Execute: func(ctx context.Context, w Response) {
+					fmt.Fprintf(w, "stats for %s", *team)
+				},
+			}
+		}))
+	return parent
+}
+
+func TestSubcommandDispatchDirect(t *testing.T) {
+	m, ms := newMuxWithMock(t, adminCmd())
+	req := mockslack.SignedSlashRequest(t, "test-secret", "/admin", "user-stats -team eng",
+		"U1", "alice", "C1", ms.ResponseURL())
+	w := httptest.NewRecorder()
+	m.SlashHandler().ServeHTTP(w, req)
+	calls := ms.WaitFor(1, time.Second)
+	body := calls[0].Body
+	if body["response_type"] != "in_channel" {
+		t.Fatalf("response_type: %v", body["response_type"])
+	}
+	if !strings.Contains(flattenBlocksText(body["blocks"].([]any)), "stats for eng") {
+		t.Fatalf("expected sibling sub not invoked; rendered: %s",
+			flattenBlocksText(body["blocks"].([]any)))
+	}
+}
+
+func TestSubcommandDispatchConfirmFlow(t *testing.T) {
+	m, ms := newMuxWithMock(t, adminCmd())
+	req := mockslack.SignedSlashRequest(t, "test-secret", "/admin", "user-create -name alice",
+		"U1", "alice", "C1", ms.ResponseURL())
+	w := httptest.NewRecorder()
+	m.SlashHandler().ServeHTTP(w, req)
+	calls := ms.WaitFor(1, time.Second)
+	body := calls[0].Body
+	if body["response_type"] != "in_channel" {
+		t.Fatalf("expected in_channel preview, got %v", body["response_type"])
+	}
+	rendered := flattenBlocksText(body["blocks"].([]any))
+	if !strings.Contains(rendered, "about to create alice") {
+		t.Fatalf("preview text missing: %s", rendered)
+	}
+	md := body["metadata"].(map[string]any)
+	payload := md["event_payload"].(map[string]any)
+	subField, ok := payload["sub"].([]any)
+	if !ok || len(subField) != 1 || subField[0] != "user-create" {
+		t.Fatalf("expected sub=[user-create] in metadata, got %#v", payload["sub"])
+	}
+	args := payload["args"].(map[string]any)
+	if args["name"] != "alice" {
+		t.Fatalf("args.name: %v", args["name"])
+	}
+	// Button stores the top-level slash, not the sub.
+	last := body["blocks"].([]any)[len(body["blocks"].([]any))-1].(map[string]any)
+	if last["type"] != "actions" {
+		t.Fatalf("expected actions block")
+	}
+	for _, el := range last["elements"].([]any) {
+		if elm := el.(map[string]any); elm["value"] != "/admin" {
+			t.Fatalf("button value should be top-level /admin, got %v", elm["value"])
+		}
+	}
+}
+
+func TestSubcommandHelpRoot(t *testing.T) {
+	m, ms := newMuxWithMock(t, adminCmd())
+	req := mockslack.SignedSlashRequest(t, "test-secret", "/admin", "",
+		"U1", "alice", "C1", ms.ResponseURL())
+	w := httptest.NewRecorder()
+	m.SlashHandler().ServeHTTP(w, req)
+	calls := ms.WaitFor(1, time.Second)
+	if calls[0].Body["response_type"] != "ephemeral" {
+		t.Fatalf("expected ephemeral help, got %v", calls[0].Body["response_type"])
+	}
+	rendered := flattenBlocksText(calls[0].Body["blocks"].([]any))
+	if !strings.Contains(rendered, "user-create") || !strings.Contains(rendered, "user-stats") {
+		t.Fatalf("expected sub names in help, got: %s", rendered)
+	}
+	if !strings.Contains(rendered, "create a user") {
+		t.Fatalf("expected sub descriptions, got: %s", rendered)
+	}
+}
+
+func TestSubcommandHelpFlagAndKeyword(t *testing.T) {
+	for _, arg := range []string{"-h", "--help", "help"} {
+		t.Run(arg, func(t *testing.T) {
+			m, ms := newMuxWithMock(t, adminCmd())
+			req := mockslack.SignedSlashRequest(t, "test-secret", "/admin", arg,
+				"U1", "alice", "C1", ms.ResponseURL())
+			w := httptest.NewRecorder()
+			m.SlashHandler().ServeHTTP(w, req)
+			calls := ms.WaitFor(1, time.Second)
+			rendered := flattenBlocksText(calls[0].Body["blocks"].([]any))
+			if !strings.Contains(rendered, "user-create") {
+				t.Fatalf("%s: expected sub list, got: %s", arg, rendered)
+			}
+		})
+	}
+}
+
+func TestSubcommandLeafHelp(t *testing.T) {
+	m, ms := newMuxWithMock(t, adminCmd())
+	req := mockslack.SignedSlashRequest(t, "test-secret", "/admin", "user-create -h",
+		"U1", "alice", "C1", ms.ResponseURL())
+	w := httptest.NewRecorder()
+	m.SlashHandler().ServeHTTP(w, req)
+	calls := ms.WaitFor(1, time.Second)
+	rendered := flattenBlocksText(calls[0].Body["blocks"].([]any))
+	// Leaf help comes from flag.FlagSet.Usage — should include flag name.
+	if !strings.Contains(rendered, "-name") {
+		t.Fatalf("expected flag listing for user-create, got: %s", rendered)
+	}
+}
+
+func TestSubcommandUnknown(t *testing.T) {
+	m, ms := newMuxWithMock(t, adminCmd())
+	req := mockslack.SignedSlashRequest(t, "test-secret", "/admin", "nonexistent",
+		"U1", "alice", "C1", ms.ResponseURL())
+	w := httptest.NewRecorder()
+	m.SlashHandler().ServeHTTP(w, req)
+	calls := ms.WaitFor(1, time.Second)
+	if calls[0].Body["response_type"] != "ephemeral" {
+		t.Fatalf("expected ephemeral for unknown sub, got %v", calls[0].Body["response_type"])
+	}
+	rendered := flattenBlocksText(calls[0].Body["blocks"].([]any))
+	if !strings.Contains(rendered, "unknown subcommand") {
+		t.Fatalf("expected unknown-sub error, got: %s", rendered)
+	}
+	if !strings.Contains(rendered, "user-create") {
+		t.Fatalf("expected sub list in unknown-sub message, got: %s", rendered)
+	}
+}
+
+func TestSubcommandConfirmRoundTrip(t *testing.T) {
+	m, ms := newMuxWithMock(t, adminCmd())
+	payload := basicConfirmPayload(ms.ResponseURL(), "/admin", "U1", "alice", map[string]any{
+		"args":       map[string]any{"name": "alice"},
+		"set":        []any{"name"},
+		"sub":        []any{"user-create"},
+		"invoker":    "U1",
+		"invoked_at": "2026-04-29T10:00:00Z",
+	})
+	req := mockslack.SignedInteractionRequest(t, "test-secret", payload)
+	w := httptest.NewRecorder()
+	m.InteractionHandler().ServeHTTP(w, req)
+	calls := ms.WaitFor(2, 2*time.Second)
+	var thread *mockslack.Call
+	for i := range calls {
+		if strings.Contains(calls[i].URL, "chat.postMessage") {
+			thread = &calls[i]
+		}
+	}
+	if thread == nil {
+		t.Fatal("expected thread reply")
+	}
+	threadText := flattenBlocksText(thread.Body["blocks"].([]any))
+	if !strings.Contains(threadText, "created alice") {
+		t.Fatalf("expected user-create Execute output, got: %s", threadText)
+	}
+}
+
+func TestSubcommandConfirmDrift(t *testing.T) {
+	m, ms := newMuxWithMock(t, adminCmd())
+	payload := basicConfirmPayload(ms.ResponseURL(), "/admin", "U1", "alice", map[string]any{
+		"args":       map[string]any{},
+		"set":        []any{},
+		"sub":        []any{"removed-sub"},
+		"invoker":    "U1",
+		"invoked_at": "2026-04-29T10:00:00Z",
+	})
+	req := mockslack.SignedInteractionRequest(t, "test-secret", payload)
+	w := httptest.NewRecorder()
+	m.InteractionHandler().ServeHTTP(w, req)
+	calls := ms.WaitFor(1, 2*time.Second)
+	// Should have a thread reply with the drift error, no replace_original.
+	var thread *mockslack.Call
+	for i := range calls {
+		if strings.Contains(calls[i].URL, "chat.postMessage") {
+			thread = &calls[i]
+		}
+		if strings.Contains(calls[i].URL, "/response/") && calls[i].Body["replace_original"] == true {
+			t.Fatalf("button must not be stripped on drift")
+		}
+	}
+	if thread == nil {
+		t.Fatal("expected thread reply with drift error")
+	}
+	threadText := flattenBlocksText(thread.Body["blocks"].([]any))
+	if !strings.Contains(threadText, "no longer exists") {
+		t.Fatalf("expected drift error, got: %s", threadText)
+	}
+}
+
 func TestSlashConcurrentInvocations(t *testing.T) {
 	cmd := New("/foo", "", func(fs *flag.FlagSet) Handlers {
 		id := fs.String("id", "", "")
