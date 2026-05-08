@@ -572,6 +572,38 @@ func TestInteractionCorruptMetadata(t *testing.T) {
 	}
 }
 
+func TestSlashFailureEchoesInput(t *testing.T) {
+	cmd := New("/foo", "", func(fs *flag.FlagSet) Handlers {
+		return Handlers{
+			Validate: func() error { return fmt.Errorf("id is required") },
+			Execute:  func(ctx context.Context, w Response) {},
+		}
+	})
+	m, ms := newMuxWithMock(t, cmd)
+	req := mockslack.SignedSlashRequest(t, "test-secret", "/foo", "-bogus value",
+		"U1", "alice", "C1", ms.ResponseURL())
+	w := httptest.NewRecorder()
+	m.SlashHandler().ServeHTTP(w, req)
+	calls := ms.WaitFor(1, time.Second)
+	rendered := flattenBlocksText(calls[0].Body["blocks"].([]any))
+	if !strings.Contains(rendered, "/foo -bogus value") {
+		t.Fatalf("expected input echo in failure, got: %s", rendered)
+	}
+}
+
+func TestSubcommandUnknownEchoesInput(t *testing.T) {
+	m, ms := newMuxWithMock(t, adminCmd())
+	req := mockslack.SignedSlashRequest(t, "test-secret", "/admin", "nonexistent extra",
+		"U1", "alice", "C1", ms.ResponseURL())
+	w := httptest.NewRecorder()
+	m.SlashHandler().ServeHTTP(w, req)
+	calls := ms.WaitFor(1, time.Second)
+	rendered := flattenBlocksText(calls[0].Body["blocks"].([]any))
+	if !strings.Contains(rendered, "/admin nonexistent extra") {
+		t.Fatalf("expected input echo in unknown-sub failure, got: %s", rendered)
+	}
+}
+
 func TestRegisterRequiresLeadingSlash(t *testing.T) {
 	m := NewMux(Config{SigningSecret: "s", BotToken: "xoxb-x"})
 	cmd := New("foo", "", func(fs *flag.FlagSet) Handlers {

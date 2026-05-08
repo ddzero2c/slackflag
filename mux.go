@@ -127,13 +127,14 @@ func (m *Mux) serveSlash(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 
 	m.asyncRun(r.Context(), "slash:"+cmdName, func() {
+		echo := inputEchoBlock(cmdName, text)
 		if cmd == nil {
-			m.postEphemeral(respURL, []Block{Section(":x: unknown command: " + cmdName)})
+			m.postEphemeral(respURL, []Block{echo, Section(":x: unknown command: " + cmdName)})
 			return
 		}
 		args, terr := tokenize(text)
 		if terr != nil {
-			m.postEphemeral(respURL, []Block{Section(":x: tokenize: " + terr.Error())})
+			m.postEphemeral(respURL, []Block{echo, Section(":x: " + terr.Error())})
 			return
 		}
 
@@ -154,7 +155,7 @@ func (m *Mux) serveSlash(w http.ResponseWriter, r *http.Request) {
 			}
 			sub, ok := target.subs[head]
 			if !ok {
-				m.renderUnknownSub(respURL, cmd, target, subPath, head)
+				m.renderUnknownSub(respURL, echo, cmd, target, subPath, head)
 				return
 			}
 			subPath = append(subPath, head)
@@ -173,13 +174,13 @@ func (m *Mux) serveSlash(w http.ResponseWriter, r *http.Request) {
 			if usage == "" {
 				usage = err.Error()
 			}
-			m.postEphemeral(respURL, []Block{Section("```\n" + usage + "\n```")})
+			m.postEphemeral(respURL, []Block{echo, Section("```\n" + usage + "\n```")})
 			return
 		}
 
 		if h.Validate != nil {
 			if err := h.Validate(); err != nil {
-				m.postEphemeral(respURL, []Block{Section(":x: " + err.Error())})
+				m.postEphemeral(respURL, []Block{echo, Section(":x: " + err.Error())})
 				return
 			}
 		}
@@ -193,7 +194,7 @@ func (m *Mux) serveSlash(w http.ResponseWriter, r *http.Request) {
 		}, resp)
 
 		if resp.failed {
-			m.postEphemeral(respURL, resp.flushBlocks())
+			m.postEphemeral(respURL, append([]Block{echo}, resp.flushBlocks()...))
 			return
 		}
 
@@ -227,7 +228,7 @@ func (m *Mux) serveSlash(w http.ResponseWriter, r *http.Request) {
 		mdRaw, err := md.marshal()
 		if err != nil {
 			m.logger.Error("metadata marshal failed", "cmd", label, "err", err)
-			m.postEphemeral(respURL, []Block{Section(":x: internal error, please try again")})
+			m.postEphemeral(respURL, []Block{echo, Section(":x: internal error, please try again")})
 			return
 		}
 		blocks := append(resp.flushBlocks(),
@@ -476,13 +477,24 @@ func (m *Mux) renderHelp(respURL string, top *Command, target *Command, subPath 
 }
 
 // renderUnknownSub posts an ephemeral when a positional token doesn't match
-// any subcommand of target.
-func (m *Mux) renderUnknownSub(respURL string, top *Command, target *Command, subPath []string, name string) {
+// any subcommand of target. echo carries the user's original input so they
+// can see what they typed alongside the error.
+func (m *Mux) renderUnknownSub(respURL string, echo Block, top *Command, target *Command, subPath []string, name string) {
 	var b strings.Builder
 	fmt.Fprintf(&b, ":x: unknown subcommand `%s`\n\n", name)
 	fmt.Fprintf(&b, "Available subcommands for *%s*:\n", cmdLabel(top, subPath))
 	b.WriteString(formatSubList(target))
-	m.postEphemeral(respURL, []Block{Section(b.String())})
+	m.postEphemeral(respURL, []Block{echo, Section(b.String())})
+}
+
+// inputEchoBlock returns a Slack mrkdwn blockquote echoing the user's
+// original slash invocation, prepended to failure ephemerals so the user
+// sees what they typed.
+func inputEchoBlock(cmdName, text string) Block {
+	if text == "" {
+		return Section("> " + cmdName)
+	}
+	return Section("> " + cmdName + " " + text)
 }
 
 // formatSubList renders one line per direct subcommand in registration order.
