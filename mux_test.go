@@ -132,6 +132,9 @@ func TestSlashHelpFlag(t *testing.T) {
 	if !strings.Contains(rendered, "-id") {
 		t.Fatalf("expected flag listing, got: %s", rendered)
 	}
+	if n := strings.Count(rendered, "Usage of"); n != 1 {
+		t.Fatalf("expected usage header once, got %d:\n%s", n, rendered)
+	}
 }
 
 func TestSlashPreviewFail(t *testing.T) {

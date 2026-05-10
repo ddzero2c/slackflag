@@ -169,7 +169,8 @@ func (m *Mux) serveSlash(w http.ResponseWriter, r *http.Request) {
 		fs.SetOutput(&usageBuf)
 		h := target.build(fs)
 		if err := fs.Parse(args); err != nil {
-			fs.Usage()
+			// fs.Parse writes the error and usage to fs.Output() itself;
+			// don't call fs.Usage() again or the message duplicates.
 			usage := usageBuf.String()
 			if usage == "" {
 				usage = err.Error()
