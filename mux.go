@@ -390,6 +390,11 @@ func (m *Mux) serveInteraction(w http.ResponseWriter, r *http.Request) {
 					[]Block{Section(":x: " + err.Error())})
 				return
 			}
+
+			// Strip the buttons before running Execute so the invoker can't
+			// double-click during the (possibly long) Execute window.
+			m.markProcessing(payload.ResponseURL, payload.Message.Blocks, payload.User.Name)
+
 			ctx := context.Background()
 			resp := newResponse()
 			safeRun(m.logger, "execute "+label, func() {
@@ -398,7 +403,9 @@ func (m *Mux) serveInteraction(w http.ResponseWriter, r *http.Request) {
 			threadBlocks := resp.flushBlocks()
 			m.postThread(payload.Channel.ID, payload.Message.TS, threadBlocks)
 			if resp.failed {
-				// keep button alive — do NOT replace_original
+				// restore the original message (with buttons) so the invoker
+				// can retry once they've seen the error in the thread reply
+				m.restoreButtons(payload.ResponseURL, payload.Message.Blocks)
 				return
 			}
 			m.finalizePreview(payload.ResponseURL, payload.Message.Blocks,
@@ -420,6 +427,33 @@ func (m *Mux) finalizePreview(respURL string, original []any, footerText string)
 		"blocks":           stripped,
 	}); err != nil {
 		m.logger.Warn("finalize preview failed", "err", err)
+	}
+}
+
+// markProcessing replaces the preview while Execute is in flight: the actions
+// block is removed and a transient "running…" footer is appended. This closes
+// the double-click window between our 200 OK and the final replace_original
+// from finalizePreview / restoreButtons.
+func (m *Mux) markProcessing(respURL string, original []any, userName string) {
+	stripped := stripActions(original)
+	stripped = append(stripped, Section(fmt.Sprintf(":hourglass_flowing_sand: running by <@%s>…", userName)))
+	if err := m.client.postResponseURL(context.Background(), respURL, map[string]any{
+		"replace_original": true,
+		"blocks":           stripped,
+	}); err != nil {
+		m.logger.Warn("mark processing failed", "err", err)
+	}
+}
+
+// restoreButtons re-posts the original preview blocks (including the actions
+// row) so an Execute failure leaves the invoker able to retry — undoing the
+// strip done by markProcessing.
+func (m *Mux) restoreButtons(respURL string, original []any) {
+	if err := m.client.postResponseURL(context.Background(), respURL, map[string]any{
+		"replace_original": true,
+		"blocks":           original,
+	}); err != nil {
+		m.logger.Warn("restore buttons failed", "err", err)
 	}
 }
 

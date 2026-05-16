@@ -311,18 +311,30 @@ func TestInteractionConfirmSuccess(t *testing.T) {
 	req := mockslack.SignedInteractionRequest(t, "test-secret", payload)
 	w := httptest.NewRecorder()
 	m.InteractionHandler().ServeHTTP(w, req)
-	calls := ms.WaitFor(2, 2*time.Second) // expect: thread post + response_url update
+	// expect: markProcessing + thread post + finalize replace_original
+	calls := ms.WaitFor(3, 2*time.Second)
 
-	var threadCall, updateCall *mockslack.Call
+	var threadCall, processingCall, finalizeCall *mockslack.Call
 	for i := range calls {
 		if strings.Contains(calls[i].URL, "chat.postMessage") {
 			threadCall = &calls[i]
-		} else if strings.Contains(calls[i].URL, "/response/") {
-			updateCall = &calls[i]
+			continue
+		}
+		if strings.Contains(calls[i].URL, "/response/") && calls[i].Body["replace_original"] == true {
+			text := flattenBlocksText(calls[i].Body["blocks"].([]any))
+			switch {
+			case strings.Contains(text, "running by"):
+				processingCall = &calls[i]
+			case strings.Contains(text, "executed by"):
+				finalizeCall = &calls[i]
+			}
 		}
 	}
-	if threadCall == nil || updateCall == nil {
-		t.Fatalf("missing call: thread=%v update=%v calls=%v", threadCall, updateCall, calls)
+	if processingCall == nil {
+		t.Fatalf("missing markProcessing replace_original; calls=%v", calls)
+	}
+	if threadCall == nil || finalizeCall == nil {
+		t.Fatalf("missing call: thread=%v finalize=%v calls=%v", threadCall, finalizeCall, calls)
 	}
 	if threadCall.Body["thread_ts"] != "1714000000.001" {
 		t.Fatalf("thread_ts: %v", threadCall.Body["thread_ts"])
@@ -332,20 +344,76 @@ func TestInteractionConfirmSuccess(t *testing.T) {
 		t.Fatalf("thread reply: %s", threadText)
 	}
 
-	updateText := flattenBlocksText(updateCall.Body["blocks"].([]any))
-	if strings.Contains(updateText, "Confirm") || strings.Contains(updateText, "Cancel") {
-		t.Fatalf("buttons should be stripped: %s", updateText)
+	finalizeText := flattenBlocksText(finalizeCall.Body["blocks"].([]any))
+	if strings.Contains(finalizeText, "Confirm") || strings.Contains(finalizeText, "Cancel") {
+		t.Fatalf("buttons should be stripped: %s", finalizeText)
 	}
-	if !strings.Contains(updateText, "executed by <@alice>") {
-		t.Fatalf("footer missing: %s", updateText)
+	if !strings.Contains(finalizeText, "executed by <@alice>") {
+		t.Fatalf("footer missing: %s", finalizeText)
 	}
-	if updateCall.Body["replace_original"] != true {
-		t.Fatalf("replace_original missing")
+	// processing message must also have actions stripped
+	for _, b := range processingCall.Body["blocks"].([]any) {
+		if bm, ok := b.(map[string]any); ok && bm["type"] == "actions" {
+			t.Fatal("actions block must be stripped during processing")
+		}
 	}
 }
 
 // errFakeNotFound is a stable error for tests asserting on Fail behavior.
 var errFakeNotFound = fmt.Errorf("user not found")
+
+// TestInteractionConfirmDisablesButtonsBeforeExecute pins the timing contract:
+// the markProcessing replace_original (which strips the actions block) must hit
+// Slack *before* Execute returns, so the invoker can't double-click during a
+// slow Execute.
+func TestInteractionConfirmDisablesButtonsBeforeExecute(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	cmd := New("/delete-user", "", func(fs *flag.FlagSet) Handlers {
+		return Handlers{
+			Preview: func(ctx context.Context, w Response) {},
+			Execute: func(ctx context.Context, w Response) {
+				close(started)
+				<-release
+				fmt.Fprint(w, "done")
+			},
+		}
+	})
+	m, ms := newMuxWithMock(t, cmd)
+	payload := basicConfirmPayload(ms.ResponseURL(), "/delete-user", "U1", "alice", map[string]any{
+		"args": map[string]any{}, "set": []any{}, "invoker": "U1", "invoked_at": "2026-04-29T10:00:00Z",
+	})
+	req := mockslack.SignedInteractionRequest(t, "test-secret", payload)
+	w := httptest.NewRecorder()
+	m.InteractionHandler().ServeHTTP(w, req)
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Execute never ran")
+	}
+	// while Execute is blocked: markProcessing must already be visible.
+	calls := ms.WaitFor(1, 2*time.Second)
+	var mark *mockslack.Call
+	for i := range calls {
+		if strings.Contains(calls[i].URL, "/response/") && calls[i].Body["replace_original"] == true {
+			mark = &calls[i]
+		}
+	}
+	if mark == nil {
+		t.Fatal("markProcessing must reach Slack before Execute returns")
+	}
+	rendered := flattenBlocksText(mark.Body["blocks"].([]any))
+	if !strings.Contains(rendered, "running by <@alice>") {
+		t.Fatalf("processing footer missing: %s", rendered)
+	}
+	for _, b := range mark.Body["blocks"].([]any) {
+		if bm, ok := b.(map[string]any); ok && bm["type"] == "actions" {
+			t.Fatal("actions block must be stripped while processing")
+		}
+	}
+	close(release)
+}
 
 func TestInteractionExecuteFailPreservesButton(t *testing.T) {
 	cmd := New("/delete-user", "", func(fs *flag.FlagSet) Handlers {
@@ -361,21 +429,37 @@ func TestInteractionExecuteFailPreservesButton(t *testing.T) {
 	req := mockslack.SignedInteractionRequest(t, "test-secret", payload)
 	w := httptest.NewRecorder()
 	m.InteractionHandler().ServeHTTP(w, req)
-	calls := ms.WaitFor(1, 2*time.Second)
-	// must NOT include a response_url replace_original call
-	for _, c := range calls {
-		if strings.Contains(c.URL, "/response/") {
-			if c.Body["replace_original"] == true {
-				t.Fatalf("button should not be stripped on failure")
-			}
-		}
-	}
-	// thread reply must contain the err
-	var thread *mockslack.Call
+	// expect: markProcessing + thread reply + restoreButtons
+	calls := ms.WaitFor(3, 2*time.Second)
+
+	var thread, processing, restore *mockslack.Call
 	for i := range calls {
 		if strings.Contains(calls[i].URL, "chat.postMessage") {
 			thread = &calls[i]
+			continue
 		}
+		if !strings.Contains(calls[i].URL, "/response/") || calls[i].Body["replace_original"] != true {
+			continue
+		}
+		// distinguish processing (no actions block) from restore (actions intact)
+		hasActions := false
+		for _, b := range calls[i].Body["blocks"].([]any) {
+			if bm, ok := b.(map[string]any); ok && bm["type"] == "actions" {
+				hasActions = true
+				break
+			}
+		}
+		if hasActions {
+			restore = &calls[i]
+		} else {
+			processing = &calls[i]
+		}
+	}
+	if processing == nil {
+		t.Fatal("expected markProcessing replace_original before Execute")
+	}
+	if restore == nil {
+		t.Fatal("expected restoreButtons replace_original (actions intact) after failure so user can retry")
 	}
 	if thread == nil {
 		t.Fatal("missing thread reply")
@@ -399,7 +483,8 @@ func TestInteractionExecutePanicRecovers(t *testing.T) {
 	req := mockslack.SignedInteractionRequest(t, "test-secret", payload)
 	w := httptest.NewRecorder()
 	m.InteractionHandler().ServeHTTP(w, req) // must not crash
-	calls := ms.WaitFor(1, 2*time.Second)
+	// panic is treated as failure: markProcessing + thread reply + restoreButtons
+	calls := ms.WaitFor(3, 2*time.Second)
 	var thread *mockslack.Call
 	for i := range calls {
 		if strings.Contains(calls[i].URL, "chat.postMessage") {
@@ -789,7 +874,8 @@ func TestSubcommandConfirmRoundTrip(t *testing.T) {
 	req := mockslack.SignedInteractionRequest(t, "test-secret", payload)
 	w := httptest.NewRecorder()
 	m.InteractionHandler().ServeHTTP(w, req)
-	calls := ms.WaitFor(2, 2*time.Second)
+	// markProcessing + thread reply + finalizePreview
+	calls := ms.WaitFor(3, 2*time.Second)
 	var thread *mockslack.Call
 	for i := range calls {
 		if strings.Contains(calls[i].URL, "chat.postMessage") {
