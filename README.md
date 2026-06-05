@@ -50,4 +50,48 @@ Limitation: top-level flags before the subcommand
 (`/admin -dry-run user-create …`) are not supported in this version. The
 first positional token must be the subcommand name.
 
+## Proactive messages and interaction routing
+
+Slash commands aren't the only way to put buttons in a channel. `Poster` sends
+a proactive `chat.postMessage` to any channel, and `Mux.HandleAction` routes
+clicks on its buttons to a handler keyed by exact `action_id`. The slash command
+confirm/cancel flow is independent and unaffected.
+
+```go
+poster := slackflag.NewPoster(cfg) // same Config as NewMux
+
+// Post an approval card. The button value carries your context (an order id),
+// and Metadata round-trips back to the handler as Interaction.Metadata.
+ts, err := poster.Post(ctx, slackflag.Message{
+    Channel:  "C0123ABCDEF",
+    Fallback: "Order ord-1001 needs approval", // notification + a11y text
+    Blocks: []slackflag.Block{
+        slackflag.Header("Order ord-1001"),
+        slackflag.Section("A new order needs your approval."),
+        slackflag.Actions(
+            slackflag.Button("order.approve", "Approve", "ord-1001", "primary"),
+            slackflag.Button("order.reject", "Reject", "ord-1001", "danger"),
+        ),
+    },
+    Metadata: map[string]any{"order_id": "ord-1001"},
+})
+
+// Route clicks. Blocks written to w replace the original message; returning an
+// error (or w.Fail) restores the buttons with an error note so the user can
+// retry. action_ids starting with "slackflag." are reserved and panic.
+mux.HandleAction("order.approve", func(ctx context.Context, ic slackflag.Interaction, w slackflag.Response) error {
+    fmt.Fprintf(w, ":white_check_mark: order %s approved by <@%s>", ic.Value, ic.UserName)
+    return nil
+})
+```
+
+`Interaction` carries `ActionID`, `Value`, `UserID`, `UserName`, `Channel`,
+`MessageTS` (for a later `chat.update`), and `Metadata`. On a click slackflag
+strips the buttons immediately (closing the double-click window) before running
+the handler, mirroring the confirm/cancel lifecycle.
+
+`Poster` is stateless — no scheduling, retry, or outbox. Pairing a send with a
+database transaction, and handing long work to your own queue (Slack expects an
+ack within 3 seconds), are the caller's responsibility.
+
 See `examples/basic` for a runnable example.
