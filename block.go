@@ -2,15 +2,14 @@ package slackflag
 
 import "github.com/slack-go/slack"
 
-// Block is a Block Kit block. Construct one with Section, Header, Fields,
-// Divider, or Actions. It embeds slack.Block so the builders can hand back
-// slack-go's concrete block types directly; callers use the builders and never
-// import slack-go themselves.
-type Block interface{ slack.Block }
+// Block is a Block Kit block — an alias for slack.Block. Build one with
+// Section, Header, Fields, Divider, or Actions for convenience, or pass any
+// slack-go block directly.
+type Block = slack.Block
 
-// Element is an interactive Block Kit element (currently only Button) for use
-// inside Actions. It embeds slack.BlockElement for the same reason as Block.
-type Element interface{ slack.BlockElement }
+// Element is an interactive Block Kit element (e.g. Button) for use inside
+// Actions — an alias for slack.BlockElement.
+type Element = slack.BlockElement
 
 // Section returns a mrkdwn section block.
 func Section(text string) Block {
@@ -57,9 +56,5 @@ func Button(actionID, text, value, style string) Element {
 
 // Actions returns an actions block holding interactive elements.
 func Actions(elements ...Element) Block {
-	els := make([]slack.BlockElement, len(elements))
-	for i, e := range elements {
-		els[i] = e
-	}
-	return slack.NewActionBlock("", els...)
+	return slack.NewActionBlock("", elements...)
 }

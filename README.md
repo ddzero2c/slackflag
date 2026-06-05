@@ -94,4 +94,22 @@ the handler, mirroring the confirm/cancel lifecycle.
 database transaction, and handing long work to your own queue (Slack expects an
 ack within 3 seconds), are the caller's responsibility.
 
+## Relationship to slack-go
+
+slackflag is a thin framework layer **on top of** `github.com/slack-go/slack`,
+not a replacement — it adds the slash-command, Preview/Confirm lifecycle, and
+interaction-routing plumbing that slack-go doesn't, and delegates block types,
+marshaling, and the Web API client to slack-go. The two interoperate, and there
+are escape hatches wherever slackflag's convenience API isn't enough:
+
+- `slackflag.Block` / `slackflag.Element` are aliases for `slack.Block` /
+  `slack.BlockElement`, so slackflag and slack-go blocks are the same values —
+  pass either where the other is expected.
+- `Interaction.Raw` is the full `*slack.InteractionCallback` — reach for
+  `trigger_id`, `team`, `view`, `state`, or anything else slackflag doesn't surface.
+- `Message.Options []slack.MsgOption` are appended verbatim to the
+  `chat.postMessage` call (e.g. `slack.MsgOptionTS(...)` to thread a reply).
+- `Poster.Client` is the underlying `*slack.Client` for API calls slackflag
+  doesn't wrap (`chat.update`, scheduling, reactions, ...).
+
 See `examples/basic` for a runnable example.

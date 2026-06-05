@@ -299,8 +299,9 @@ func (m *Mux) serveInteraction(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
+	payloadJSON := form.Get("payload")
 	var payload interactionPayload
-	if err := json.Unmarshal([]byte(form.Get("payload")), &payload); err != nil {
+	if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
 		http.Error(w, "bad payload", http.StatusBadRequest)
 		return
 	}
@@ -316,7 +317,7 @@ func (m *Mux) serveInteraction(w http.ResponseWriter, r *http.Request) {
 		// Non-slackflag.* actions skip the confirm/cancel invoker gating below.
 		if !strings.HasPrefix(action.ActionID, "slackflag.") {
 			if h := m.lookupAction(action.ActionID); h != nil {
-				m.dispatchAction(h, payload)
+				m.dispatchAction(h, payload, parseCallback(payloadJSON))
 			} else {
 				m.logger.Warn("unknown action_id", "id", action.ActionID)
 			}
@@ -442,8 +443,13 @@ func (m *Mux) restoreButtons(respURL string, original []any, err error) {
 	m.replaceOriginal(respURL, blocks)
 }
 
-// postThread fires a chat.postMessage as a thread reply.
+// postThread fires a chat.postMessage as a thread reply. Empty blocks are
+// dropped: Slack rejects a message with no text and no blocks (no_text), so an
+// Execute that produced no output should post nothing rather than error.
 func (m *Mux) postThread(channel, threadTS string, blocks []Block) {
+	if len(blocks) == 0 {
+		return
+	}
 	if err := m.client.chatPostMessage(context.Background(), channel, threadTS, blocks); err != nil {
 		m.logger.Error("chat.postMessage failed", "err", err)
 	}

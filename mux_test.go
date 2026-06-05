@@ -362,6 +362,40 @@ func TestInteractionConfirmSuccess(t *testing.T) {
 // errFakeNotFound is a stable error for tests asserting on Fail behavior.
 var errFakeNotFound = fmt.Errorf("user not found")
 
+// TestInteractionConfirmEmptyExecuteSkipsThread pins that a successful Execute
+// that writes no output posts no thread reply (a blocks:null chat.postMessage
+// would be rejected by Slack as no_text) while still finalizing the preview.
+func TestInteractionConfirmEmptyExecuteSkipsThread(t *testing.T) {
+	cmd := New("/delete-user", "", func(fs *flag.FlagSet) Handlers {
+		return Handlers{
+			Preview: func(ctx context.Context, w Response) {},
+			Execute: func(ctx context.Context, w Response) {}, // writes nothing
+		}
+	})
+	m, ms := newMuxWithMock(t, cmd)
+	payload := basicConfirmPayload(ms.ResponseURL(), "/delete-user", "U1", "alice", map[string]any{
+		"args": map[string]any{}, "set": []any{}, "invoker": "U1", "invoked_at": "2026-04-29T10:00:00Z",
+	})
+	req := mockslack.SignedInteractionRequest(t, "test-secret", payload)
+	w := httptest.NewRecorder()
+	m.InteractionHandler().ServeHTTP(w, req)
+	// markProcessing + finalize, and no chat.postMessage thread reply.
+	calls := ms.WaitFor(2, 2*time.Second)
+	var finalize *mockslack.Call
+	for i := range calls {
+		if strings.Contains(calls[i].URL, "chat.postMessage") {
+			t.Fatalf("empty Execute output must not post a thread reply")
+		}
+		if strings.Contains(calls[i].URL, "/response/") && calls[i].Body["replace_original"] == true &&
+			strings.Contains(flattenBlocksText(calls[i].Body["blocks"].([]any)), "executed by") {
+			finalize = &calls[i]
+		}
+	}
+	if finalize == nil {
+		t.Fatal("expected finalize replace_original with executed-by footer")
+	}
+}
+
 // TestInteractionConfirmDisablesButtonsBeforeExecute pins the timing contract:
 // the markProcessing replace_original (which strips the actions block) must hit
 // Slack *before* Execute returns, so the invoker can't double-click during a

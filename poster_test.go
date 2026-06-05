@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ddzero2c/slackflag/internal/mockslack"
+	"github.com/slack-go/slack"
 )
 
 func TestPosterPost(t *testing.T) {
@@ -80,5 +81,23 @@ func TestPosterPostWithoutMetadata(t *testing.T) {
 	calls := ms.WaitFor(1, time.Second)
 	if _, ok := calls[0].Body["metadata"]; ok {
 		t.Fatalf("metadata should be absent when Message.Metadata is nil, got %v", calls[0].Body["metadata"])
+	}
+}
+
+func TestPosterPassThroughOptions(t *testing.T) {
+	ms := mockslack.New(t)
+	p := NewPoster(Config{BotToken: "xoxb-test", SlackBaseURL: ms.URL()})
+
+	if _, err := p.Post(context.Background(), Message{
+		Channel:  "C1",
+		Fallback: "reply",
+		Blocks:   []Block{Section("hi")},
+		Options:  []slack.MsgOption{slack.MsgOptionTS("1700000000.000001")},
+	}); err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	calls := ms.WaitFor(1, time.Second)
+	if calls[0].Body["thread_ts"] != "1700000000.000001" {
+		t.Fatalf("pass-through MsgOptionTS did not reach slack-go: %v", calls[0].Body["thread_ts"])
 	}
 }
