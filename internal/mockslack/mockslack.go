@@ -50,13 +50,35 @@ func (s *Server) ResponseURL() string { return s.respURL }
 
 func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
-	var decoded map[string]any
-	_ = json.Unmarshal(body, &decoded)
+	decoded := decodeAPIBody(r.Header.Get("Content-Type"), body)
 	s.mu.Lock()
 	s.calls = append(s.calls, Call{URL: r.URL.Path, Body: decoded, Header: r.Header.Clone()})
 	s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(`{"ok":true}`))
+	_, _ = w.Write([]byte(`{"ok":true,"channel":"C_POSTED","ts":"1717000000.000100"}`))
+}
+
+// decodeAPIBody normalizes a chat.postMessage body into a map for assertions.
+// The hand-rolled slackClient sends JSON; slack-go's Poster sends
+// form-encoded with blocks/metadata carried as JSON-string fields.
+func decodeAPIBody(contentType string, body []byte) map[string]any {
+	decoded := map[string]any{}
+	if strings.Contains(contentType, "application/json") {
+		_ = json.Unmarshal(body, &decoded)
+		return decoded
+	}
+	form, _ := url.ParseQuery(string(body))
+	for k := range form {
+		v := form.Get(k)
+		// blocks/metadata arrive JSON-encoded; decode them, keep scalars as strings.
+		var parsed any
+		if json.Unmarshal([]byte(v), &parsed) == nil {
+			decoded[k] = parsed
+		} else {
+			decoded[k] = v
+		}
+	}
+	return decoded
 }
 
 func (s *Server) handleResponseURL(w http.ResponseWriter, r *http.Request) {

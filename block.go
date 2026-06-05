@@ -1,23 +1,27 @@
 package slackflag
 
-// Block is anything that JSON-marshals to a valid Slack Block Kit block.
-// Type alias keeps the package zero-dep but compatible with slack-go/slack types.
-type Block = any
+import "github.com/slack-go/slack"
+
+// Block is a Block Kit block. Construct one with Section, Header, Fields,
+// Divider, or Actions. It embeds slack.Block so the builders can hand back
+// slack-go's concrete block types directly; callers use the builders and never
+// import slack-go themselves.
+type Block interface{ slack.Block }
+
+// Element is an interactive Block Kit element (currently only Button) for use
+// inside Actions. It embeds slack.BlockElement for the same reason as Block.
+type Element interface{ slack.BlockElement }
 
 // Section returns a mrkdwn section block.
 func Section(text string) Block {
-	return map[string]any{
-		"type": "section",
-		"text": map[string]any{"type": "mrkdwn", "text": text},
-	}
+	return slack.NewSectionBlock(
+		slack.NewTextBlockObject(slack.MarkdownType, text, false, false), nil, nil)
 }
 
 // Header returns a plain_text header block.
 func Header(text string) Block {
-	return map[string]any{
-		"type": "header",
-		"text": map[string]any{"type": "plain_text", "text": text, "emoji": true},
-	}
+	return slack.NewHeaderBlock(
+		slack.NewTextBlockObject(slack.PlainTextType, text, true, false))
 }
 
 // Fields returns a section with key/value mrkdwn fields. kv is flat: k1, v1, k2, v2, ...
@@ -26,20 +30,36 @@ func Fields(kv ...string) Block {
 	if len(kv)%2 != 0 {
 		panic("slackflag.Fields: odd number of arguments")
 	}
-	fields := make([]map[string]any, 0, len(kv)/2)
+	objs := make([]*slack.TextBlockObject, 0, len(kv)/2)
 	for i := 0; i < len(kv); i += 2 {
-		fields = append(fields, map[string]any{
-			"type": "mrkdwn",
-			"text": "*" + kv[i] + "*\n" + kv[i+1],
-		})
+		objs = append(objs, slack.NewTextBlockObject(slack.MarkdownType, "*"+kv[i]+"*\n"+kv[i+1], false, false))
 	}
-	return map[string]any{
-		"type":   "section",
-		"fields": fields,
-	}
+	return slack.NewSectionBlock(nil, objs, nil)
 }
 
 // Divider returns a divider block.
-func Divider() Block {
-	return map[string]any{"type": "divider"}
+func Divider() Block { return slack.NewDividerBlock() }
+
+// Button returns an interactive button element. style is "" (default),
+// "primary", or "danger". value travels back to the handler as
+// Interaction.Value when the button is clicked.
+func Button(actionID, text, value, style string) Element {
+	btn := slack.NewButtonBlockElement(actionID, value,
+		slack.NewTextBlockObject(slack.PlainTextType, text, false, false))
+	switch style {
+	case "primary":
+		btn.Style = slack.StylePrimary
+	case "danger":
+		btn.Style = slack.StyleDanger
+	}
+	return btn
+}
+
+// Actions returns an actions block holding interactive elements.
+func Actions(elements ...Element) Block {
+	els := make([]slack.BlockElement, len(elements))
+	for i, e := range elements {
+		els[i] = e
+	}
+	return slack.NewActionBlock("", els...)
 }

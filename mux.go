@@ -24,12 +24,15 @@ type Config struct {
 	SlackBaseURL  string
 }
 
+const metadataEventType = "slackflag"
+
 type Mux struct {
 	cfg      Config
 	logger   *slog.Logger
 	client   *slackClient
 	mu       sync.RWMutex
 	commands map[string]*Command
+	actions  map[string]ActionFunc
 	now      func() time.Time // for tests
 }
 
@@ -57,6 +60,7 @@ func NewMux(cfg Config) *Mux {
 		logger:   cfg.Logger,
 		client:   &slackClient{httpClient: cfg.HTTPClient, baseURL: cfg.SlackBaseURL, botToken: cfg.BotToken},
 		commands: map[string]*Command{},
+		actions:  map[string]ActionFunc{},
 		now:      time.Now,
 	}
 }
@@ -239,7 +243,7 @@ func (m *Mux) serveSlash(w http.ResponseWriter, r *http.Request) {
 			"response_type": "in_channel",
 			"blocks":        blocks,
 			"metadata": map[string]any{
-				"event_type":    "slackflag",
+				"event_type":    metadataEventType,
 				"event_payload": json.RawMessage(mdRaw),
 			},
 		}); err != nil {
@@ -273,27 +277,14 @@ func safeRun(logger *slog.Logger, label string, fn func(), resp *response) {
 	fn()
 }
 
-// actionsBlock returns the Confirm/Cancel buttons for a command.
+// actionsBlock returns the Confirm/Cancel buttons for a command. The button
+// values carry the top-level command name so the interaction handler can look
+// it up.
 func actionsBlock(cmdName string) Block {
-	return map[string]any{
-		"type": "actions",
-		"elements": []map[string]any{
-			{
-				"type":      "button",
-				"text":      map[string]any{"type": "plain_text", "text": "Confirm"},
-				"style":     "primary",
-				"action_id": "slackflag.confirm",
-				"value":     cmdName,
-			},
-			{
-				"type":      "button",
-				"text":      map[string]any{"type": "plain_text", "text": "Cancel"},
-				"style":     "danger",
-				"action_id": "slackflag.cancel",
-				"value":     cmdName,
-			},
-		},
-	}
+	return Actions(
+		Button("slackflag.confirm", "Confirm", cmdName, "primary"),
+		Button("slackflag.cancel", "Cancel", cmdName, "danger"),
+	)
 }
 
 func (m *Mux) serveInteraction(w http.ResponseWriter, r *http.Request) {
@@ -308,24 +299,7 @@ func (m *Mux) serveInteraction(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
-	var payload struct {
-		Type    string `json:"type"`
-		User    struct{ ID, Name string } `json:"user"`
-		Channel struct{ ID string }       `json:"channel"`
-		Actions []struct {
-			ActionID string `json:"action_id"`
-			Value    string `json:"value"`
-		} `json:"actions"`
-		Message struct {
-			TS       string          `json:"ts"`
-			Blocks   []any           `json:"blocks"`
-			Metadata struct {
-				EventType    string          `json:"event_type"`
-				EventPayload json.RawMessage `json:"event_payload"`
-			} `json:"metadata"`
-		} `json:"message"`
-		ResponseURL string `json:"response_url"`
-	}
+	var payload interactionPayload
 	if err := json.Unmarshal([]byte(form.Get("payload")), &payload); err != nil {
 		http.Error(w, "bad payload", http.StatusBadRequest)
 		return
@@ -338,6 +312,17 @@ func (m *Mux) serveInteraction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		action := payload.Actions[0]
+
+		// Non-slackflag.* actions skip the confirm/cancel invoker gating below.
+		if !strings.HasPrefix(action.ActionID, "slackflag.") {
+			if h := m.lookupAction(action.ActionID); h != nil {
+				m.dispatchAction(h, payload)
+			} else {
+				m.logger.Warn("unknown action_id", "id", action.ActionID)
+			}
+			return
+		}
+
 		md, err := unmarshalMetadata(payload.Message.Metadata.EventPayload)
 		if err != nil {
 			m.logger.Warn("interaction metadata invalid", "err", err)
@@ -405,7 +390,7 @@ func (m *Mux) serveInteraction(w http.ResponseWriter, r *http.Request) {
 			if resp.failed {
 				// restore the original message (with buttons) so the invoker
 				// can retry once they've seen the error in the thread reply
-				m.restoreButtons(payload.ResponseURL, payload.Message.Blocks)
+				m.restoreButtons(payload.ResponseURL, payload.Message.Blocks, nil)
 				return
 			}
 			m.finalizePreview(payload.ResponseURL, payload.Message.Blocks,
@@ -417,17 +402,22 @@ func (m *Mux) serveInteraction(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// replaceOriginal updates the source message in place via response_url. blocks
+// may be []Block or the []any returned by stripActions; both JSON-marshal
+// correctly.
+func (m *Mux) replaceOriginal(respURL string, blocks any) {
+	if err := m.client.postResponseURL(context.Background(), respURL, map[string]any{
+		"replace_original": true,
+		"blocks":           blocks,
+	}); err != nil {
+		m.logger.Warn("replace_original failed", "err", err)
+	}
+}
+
 // finalizePreview replaces the original preview message: strips actions blocks,
 // appends a footer line.
 func (m *Mux) finalizePreview(respURL string, original []any, footerText string) {
-	stripped := stripActions(original)
-	stripped = append(stripped, Section(footerText))
-	if err := m.client.postResponseURL(context.Background(), respURL, map[string]any{
-		"replace_original": true,
-		"blocks":           stripped,
-	}); err != nil {
-		m.logger.Warn("finalize preview failed", "err", err)
-	}
+	m.replaceOriginal(respURL, append(stripActions(original), Section(footerText)))
 }
 
 // markProcessing replaces the preview while Execute is in flight: the actions
@@ -435,26 +425,21 @@ func (m *Mux) finalizePreview(respURL string, original []any, footerText string)
 // the double-click window between our 200 OK and the final replace_original
 // from finalizePreview / restoreButtons.
 func (m *Mux) markProcessing(respURL string, original []any, userName string) {
-	stripped := stripActions(original)
-	stripped = append(stripped, Section(fmt.Sprintf(":hourglass_flowing_sand: running by <@%s>…", userName)))
-	if err := m.client.postResponseURL(context.Background(), respURL, map[string]any{
-		"replace_original": true,
-		"blocks":           stripped,
-	}); err != nil {
-		m.logger.Warn("mark processing failed", "err", err)
-	}
+	footer := Section(fmt.Sprintf(":hourglass_flowing_sand: running by <@%s>…", userName))
+	m.replaceOriginal(respURL, append(stripActions(original), footer))
 }
 
-// restoreButtons re-posts the original preview blocks (including the actions
-// row) so an Execute failure leaves the invoker able to retry — undoing the
-// strip done by markProcessing.
-func (m *Mux) restoreButtons(respURL string, original []any) {
-	if err := m.client.postResponseURL(context.Background(), respURL, map[string]any{
-		"replace_original": true,
-		"blocks":           original,
-	}); err != nil {
-		m.logger.Warn("restore buttons failed", "err", err)
+// restoreButtons re-posts the original message blocks (including the actions
+// row) so a failed Execute or action leaves the user able to retry — undoing
+// the strip done by markProcessing. When err is non-nil an error section is
+// appended (the action flow surfaces the error inline; the confirm flow passes
+// nil because it reports the error in a thread reply instead).
+func (m *Mux) restoreButtons(respURL string, original []any, err error) {
+	blocks := append([]any{}, original...)
+	if err != nil {
+		blocks = append(blocks, Section(":x: "+err.Error()))
 	}
+	m.replaceOriginal(respURL, blocks)
 }
 
 // postThread fires a chat.postMessage as a thread reply.
@@ -464,9 +449,12 @@ func (m *Mux) postThread(channel, threadTS string, blocks []Block) {
 	}
 }
 
-// stripActions returns the blocks list without any "actions" blocks.
-func stripActions(blocks []any) []Block {
-	out := make([]Block, 0, len(blocks))
+// stripActions returns the blocks list without any "actions" blocks. The input
+// is the original message's blocks as Slack posted them back to us (decoded
+// generically), so each element is a map[string]any; the output stays []any so
+// it can be re-sent verbatim with our own Block footers appended.
+func stripActions(blocks []any) []any {
+	out := make([]any, 0, len(blocks))
 	for _, b := range blocks {
 		if bm, ok := b.(map[string]any); ok && bm["type"] == "actions" {
 			continue
