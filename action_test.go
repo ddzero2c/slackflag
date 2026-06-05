@@ -107,6 +107,9 @@ func TestHandleActionHappyPath(t *testing.T) {
 	if gotIC.Metadata["order_id"] != "o-7" {
 		t.Fatalf("metadata not passed through: %v", gotIC.Metadata)
 	}
+	if gotIC.Raw == nil || gotIC.Raw.User.ID != "U9" {
+		t.Fatalf("Raw slack-go callback escape hatch not populated: %+v", gotIC.Raw)
+	}
 }
 
 func TestHandleActionFailRestoresButtons(t *testing.T) {

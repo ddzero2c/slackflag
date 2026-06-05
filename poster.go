@@ -12,10 +12,15 @@ import (
 // response_url: callers use it to start a conversation, then route any button
 // clicks on that message through Mux.HandleAction.
 //
+// It wraps a slack-go client for the common case; use the Client field directly
+// for anything slackflag does not wrap (chat.update, scheduling, ...).
+//
 // Poster is stateless. It does no scheduling, retrying, or outbox bookkeeping;
 // pairing a send with a database transaction is the caller's responsibility.
 type Poster struct {
-	api *slack.Client
+	// Client is the underlying slack-go client, exposed as an escape hatch for
+	// API calls slackflag does not wrap.
+	Client *slack.Client
 }
 
 // NewPoster builds a Poster from the same Config used for NewMux. Only BotToken,
@@ -29,15 +34,16 @@ func NewPoster(cfg Config) *Poster {
 	if cfg.SlackBaseURL != "" {
 		opts = append(opts, slack.OptionAPIURL(strings.TrimRight(cfg.SlackBaseURL, "/")+"/"))
 	}
-	return &Poster{api: slack.New(cfg.BotToken, opts...)}
+	return &Poster{Client: slack.New(cfg.BotToken, opts...)}
 }
 
 // Message is an outbound chat.postMessage request.
 type Message struct {
-	Channel  string         // channel ID or name to post into
-	Fallback string         // top-level text: notification preview + accessibility fallback
-	Blocks   []Block        // Block Kit blocks built with Section/Header/Actions/...
-	Metadata map[string]any // when non-nil, attached as message metadata.event_payload and echoed back as Interaction.Metadata on a button click
+	Channel  string            // channel ID or name to post into
+	Fallback string            // top-level text: notification preview + accessibility fallback
+	Blocks   []Block           // Block Kit blocks built with Section/Header/Actions/...
+	Metadata map[string]any    // when non-nil, attached as message metadata.event_payload and echoed back as Interaction.Metadata on a button click
+	Options  []slack.MsgOption // extra slack-go options appended verbatim (thread_ts, unfurl, ...)
 }
 
 // Post sends msg and returns the posted message's timestamp (ts), usable for a
@@ -45,7 +51,7 @@ type Message struct {
 func (p *Poster) Post(ctx context.Context, msg Message) (ts string, err error) {
 	opts := []slack.MsgOption{
 		slack.MsgOptionText(msg.Fallback, false),
-		slack.MsgOptionBlocks(toSlackBlocks(msg.Blocks)...),
+		slack.MsgOptionBlocks(msg.Blocks...),
 	}
 	if msg.Metadata != nil {
 		opts = append(opts, slack.MsgOptionMetadata(slack.SlackMetadata{
@@ -53,15 +59,7 @@ func (p *Poster) Post(ctx context.Context, msg Message) (ts string, err error) {
 			EventPayload: msg.Metadata,
 		}))
 	}
-	_, ts, err = p.api.PostMessageContext(ctx, msg.Channel, opts...)
+	opts = append(opts, msg.Options...)
+	_, ts, err = p.Client.PostMessageContext(ctx, msg.Channel, opts...)
 	return ts, err
-}
-
-// toSlackBlocks re-types []Block as the []slack.Block slack-go expects.
-func toSlackBlocks(blocks []Block) []slack.Block {
-	out := make([]slack.Block, len(blocks))
-	for i, b := range blocks {
-		out[i] = b
-	}
-	return out
 }

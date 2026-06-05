@@ -69,13 +69,16 @@ func decodeAPIBody(contentType string, body []byte) map[string]any {
 	}
 	form, _ := url.ParseQuery(string(body))
 	for k := range form {
-		v := form.Get(k)
-		// blocks/metadata arrive JSON-encoded; decode them, keep scalars as strings.
-		var parsed any
-		if json.Unmarshal([]byte(v), &parsed) == nil {
-			decoded[k] = parsed
-		} else {
-			decoded[k] = v
+		decoded[k] = form.Get(k)
+	}
+	// Only these fields are JSON-encoded; decode them for structural assertions.
+	// Scalars like ts/thread_ts stay strings even though they look numeric.
+	for _, k := range []string{"blocks", "metadata", "attachments"} {
+		if v := form.Get(k); v != "" {
+			var parsed any
+			if json.Unmarshal([]byte(v), &parsed) == nil {
+				decoded[k] = parsed
+			}
 		}
 	}
 	return decoded

@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/slack-go/slack"
 )
 
 // Interaction is the context passed to an ActionFunc when a routed button is
-// clicked. It carries everything a handler typically needs without exposing the
-// raw Slack payload.
+// clicked. The named fields cover the common cases; Raw is the slack-go escape
+// hatch for anything slackflag does not surface.
 type Interaction struct {
 	ActionID  string         // the clicked button's action_id
 	Value     string         // the button's value (caller context, e.g. an order UUID)
@@ -18,6 +20,11 @@ type Interaction struct {
 	Channel   string         // channel the message lives in
 	MessageTS string         // the message's ts, for a later chat.update
 	Metadata  map[string]any // the message's metadata.event_payload, as set on Poster.Post
+
+	// Raw is the full slack-go interaction callback, for fields slackflag does
+	// not surface (trigger_id, team, view, state, ...). Best-effort: it is
+	// decoded independently of the fields above and may be partially populated.
+	Raw *slack.InteractionCallback
 }
 
 // ActionFunc handles a routed button click. Blocks written to w replace the
@@ -82,7 +89,7 @@ type interactionPayload struct {
 // It mirrors the confirm/cancel lifecycle: strip the buttons immediately to
 // close the double-click window, run the handler, then replace the message with
 // the handler's blocks (success) or restore the buttons plus an error (failure).
-func (m *Mux) dispatchAction(h ActionFunc, p interactionPayload) {
+func (m *Mux) dispatchAction(h ActionFunc, p interactionPayload, raw *slack.InteractionCallback) {
 	action := p.Actions[0]
 	original := p.Message.Blocks
 
@@ -103,6 +110,7 @@ func (m *Mux) dispatchAction(h ActionFunc, p interactionPayload) {
 		Channel:   p.Channel.ID,
 		MessageTS: p.Message.TS,
 		Metadata:  meta,
+		Raw:       raw,
 	}
 
 	resp := newResponse()
@@ -123,4 +131,13 @@ func (m *Mux) dispatchAction(h ActionFunc, p interactionPayload) {
 		return
 	}
 	m.replaceOriginal(p.ResponseURL, blocks)
+}
+
+// parseCallback decodes the raw interaction payload into slack-go's typed
+// callback for Interaction.Raw. Errors are tolerated: the result is an escape
+// hatch, not the routing source of truth.
+func parseCallback(payloadJSON string) *slack.InteractionCallback {
+	var cb slack.InteractionCallback
+	_ = json.Unmarshal([]byte(payloadJSON), &cb)
+	return &cb
 }
