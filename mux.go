@@ -443,8 +443,13 @@ func (m *Mux) restoreButtons(respURL string, original []any, err error) {
 	m.replaceOriginal(respURL, blocks)
 }
 
-// postThread fires a chat.postMessage as a thread reply.
+// postThread fires a chat.postMessage as a thread reply. Empty blocks are
+// dropped: Slack rejects a message with no text and no blocks (no_text), so an
+// Execute that produced no output should post nothing rather than error.
 func (m *Mux) postThread(channel, threadTS string, blocks []Block) {
+	if len(blocks) == 0 {
+		return
+	}
 	if err := m.client.chatPostMessage(context.Background(), channel, threadTS, blocks); err != nil {
 		m.logger.Error("chat.postMessage failed", "err", err)
 	}
